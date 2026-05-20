@@ -127,6 +127,13 @@ def get_learner_fn(
             env_state, timestep = jax.vmap(env.step, in_axes=(0, 0))(env_state, action)
 
             done = timestep.last().repeat(env.num_agents).reshape(config.arch.num_envs, -1)
+            # ``timestep.discount`` is the post-step discount from the env: 0 on
+            # true termination (Jumanji ``termination()``) and 1 on truncation /
+            # mid-episode steps. Carrying it through the rollout lets
+            # ``calculate_gae`` apply the CleanRL term-vs-trunc fix — bootstrap
+            # V(s_{t+1}) on truncation, zero it on termination. ``timestep.reward``
+            # already has shape (num_envs, num_agents); discount matches.
+            step_discount = timestep.discount
             hstates = HiddenStates(policy_hidden_state, critic_hidden_state)
             transition = RNNPPOTransition(
                 last_done,
@@ -141,10 +148,10 @@ def get_learner_fn(
                 params, opt_states, key, env_state, timestep, done, hstates
             )
             metrics = timestep.extras["episode_metrics"] | timestep.extras["env_metrics"]
-            return learner_state, (transition, metrics)
+            return learner_state, (transition, step_discount, metrics)
 
         # Step environment for rollout length
-        learner_state, (traj_batch, episode_metrics) = jax.lax.scan(
+        learner_state, (traj_batch, discount_traj, episode_metrics) = jax.lax.scan(
             _env_step, learner_state, None, config.system.rollout_length
         )
 
@@ -162,7 +169,12 @@ def get_learner_fn(
         last_val = last_val.squeeze(0)
 
         advantages, targets = calculate_gae(
-            traj_batch, last_val, last_done, config.system.gamma, config.system.gae_lambda
+            traj_batch,
+            last_val,
+            last_done,
+            config.system.gamma,
+            config.system.gae_lambda,
+            discount_traj=discount_traj,
         )
 
         def _update_epoch(update_state: Tuple, _: Any) -> Tuple:

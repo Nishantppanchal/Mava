@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Tuple, Union
+from typing import Optional, Tuple, Union
 
 import chex
 import jax
@@ -28,6 +28,7 @@ def calculate_gae(
     gamma: float,
     gae_lambda: float,
     unroll: int = 16,
+    discount_traj: Optional[chex.Array] = None,
 ) -> Tuple[chex.Array, chex.Array]:
     """Computes truncated generalized advantage estimates.
 
@@ -44,25 +45,68 @@ def calculate_gae(
         gamma (float): discount factor.
         gae_lambda (float): GAE mixing parameter.
         unroll (int): how much XLA should unroll the scan used to calculate GAE.
+        discount_traj (T, B, N), optional: per-step discount AFTER each step
+            (i.e. ``timestep.discount`` of the step's outcome). When provided,
+            the bootstrap term is masked by this discount instead of by
+            ``(1 - done)``, distinguishing true termination (discount=0) from
+            time-limit truncation (discount=1) — the CleanRL PPO term-vs-trunc
+            fix (https://github.com/vwxyzjn/cleanrl/pull/424). The
+            episode-boundary mask on GAE accumulation still uses ``(1 - done)``
+            so advantages don't leak across truncation boundaries. When
+            ``None``, the legacy ``(1 - done)`` bootstrap mask is used and
+            truncation is treated identically to termination.
 
     Returns Tuple[(B, T, N), (B, T, N)]: advantages and target values.
     """
 
-    def _get_advantages(
-        carry: Tuple[chex.Array, chex.Array, chex.Array], transition: RNNPPOTransition
-    ) -> Tuple[Tuple[chex.Array, chex.Array, chex.Array], chex.Array]:
-        gae, next_value, next_done = carry
-        done, value, reward = transition.done, transition.value, transition.reward
+    if discount_traj is None:
+        # Legacy path — bootstrap mask is (1 - done); truncation is treated
+        # as termination. Kept for backward-compat with callers that don't
+        # carry a discount trajectory through the rollout.
+        def _get_advantages(
+            carry: Tuple[chex.Array, chex.Array, chex.Array],
+            transition: RNNPPOTransition,
+        ) -> Tuple[Tuple[chex.Array, chex.Array, chex.Array], chex.Array]:
+            gae, next_value, next_done = carry
+            done, value, reward = transition.done, transition.value, transition.reward
 
-        delta = reward + gamma * next_value * (1 - next_done) - value
-        gae = delta + gamma * gae_lambda * (1 - next_done) * gae
-        return (gae, value, done), gae
+            delta = reward + gamma * next_value * (1 - next_done) - value
+            gae = delta + gamma * gae_lambda * (1 - next_done) * gae
+            return (gae, value, done), gae
 
-    _, advantages = jax.lax.scan(
-        _get_advantages,
-        (jnp.zeros_like(last_val), last_val, last_done),
-        traj_batch,
-        reverse=True,
-        unroll=unroll,
-    )
+        _, advantages = jax.lax.scan(
+            _get_advantages,
+            (jnp.zeros_like(last_val), last_val, last_done),
+            traj_batch,
+            reverse=True,
+            unroll=unroll,
+        )
+    else:
+        # Term-vs-trunc-aware path. ``discount_traj[t]`` is the discount of
+        # the step that produced s_{t+1}; for an env that uses Jumanji's
+        # ``termination()`` (discount=0), ``truncation()`` (discount=1) and
+        # ``transition()`` (discount=1), this is exactly the right mask for
+        # the V(s_{t+1}) bootstrap. The GAE-propagation mask stays
+        # ``(1 - done)`` so accumulating advantages across an episode
+        # boundary (term OR trunc) is still cut.
+        def _get_advantages_discount(
+            carry: Tuple[chex.Array, chex.Array, chex.Array],
+            inputs: Tuple[RNNPPOTransition, chex.Array],
+        ) -> Tuple[Tuple[chex.Array, chex.Array, chex.Array], chex.Array]:
+            transition, step_discount = inputs
+            gae, next_value, next_done = carry
+            done, value, reward = transition.done, transition.value, transition.reward
+
+            delta = reward + gamma * next_value * step_discount - value
+            gae = delta + gamma * gae_lambda * (1 - next_done) * gae
+            return (gae, value, done), gae
+
+        _, advantages = jax.lax.scan(
+            _get_advantages_discount,
+            (jnp.zeros_like(last_val), last_val, last_done),
+            (traj_batch, discount_traj),
+            reverse=True,
+            unroll=unroll,
+        )
+
     return advantages, advantages + traj_batch.value
