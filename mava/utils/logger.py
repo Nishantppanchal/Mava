@@ -34,7 +34,13 @@ from neptune.utils import stringify_unsupported
 from omegaconf import DictConfig, OmegaConf
 from pandas.io.json._normalize import _simple_json_normalize as flatten_dict
 from rich.pretty import pprint
-from tensorboard_logger import configure, log_value
+# NOTE: ``tensorboard_logger`` is imported lazily inside ``TensorboardLogger``
+# (not here at module top-level). It ships stale, pre-3.19 generated protobuf
+# ``_pb2.py`` files that modern protobuf's C++ backend rejects with
+# "Descriptors cannot be created directly", which forced every run to set
+# ``PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python``. Since the TensorboardLogger
+# is off by default, deferring the import means the protobuf trigger only fires
+# when tensorboard is actually enabled — no env-var workaround for normal runs.
 
 from mava.types import Metrics
 
@@ -298,6 +304,10 @@ class TensorboardLogger(BaseLogger):
         """
         tb_exp_path = get_logger_path(system_name, "tensorboard")
         tb_logs_path = os.path.join(base_exp_path, Path(tb_exp_path, unique_token))
+
+        # Lazy import — see the note at the top of this file. Only runs when a
+        # TensorboardLogger is actually constructed (tensorboard enabled).
+        from tensorboard_logger import configure, log_value
 
         configure(tb_logs_path)
         self.log = log_value
