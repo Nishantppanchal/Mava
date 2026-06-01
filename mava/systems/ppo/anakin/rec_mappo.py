@@ -232,13 +232,30 @@ def get_learner_fn(
                         critic_params, traj_batch.hstates.critic_hidden_state[0], obs_and_done
                     )
 
-                    # Clipped MSE loss
+                    # Clipped value loss. ``config.system.critic_loss`` selects
+                    # the per-element penalty: ``mse`` (stock, default) or
+                    # ``smooth_l1`` (Huber) — the latter is more robust to the
+                    # value outliers that sparse +/-10 terminal rewards produce.
+                    # Defaults to ``mse`` via ``.get`` so other systems / older
+                    # configs are unaffected. (trust_filter PERL port.)
                     value_pred_clipped = traj_batch.value + (value - traj_batch.value).clip(
                         -config.system.clip_eps, config.system.clip_eps
                     )
-                    value_losses = jnp.square(value - targets)
-                    value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                    value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+                    if config.system.get("critic_loss", "mse") == "smooth_l1":
+                        # optax.huber_loss already includes the 0.5 in its
+                        # quadratic region, so do NOT scale by 0.5 again.
+                        huber_delta = config.system.get("huber_delta", 1.0)
+                        value_losses = optax.huber_loss(value, targets, huber_delta)
+                        value_losses_clipped = optax.huber_loss(
+                            value_pred_clipped, targets, huber_delta
+                        )
+                        value_loss = jnp.maximum(value_losses, value_losses_clipped).mean()
+                    else:
+                        value_losses = jnp.square(value - targets)
+                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
+                        value_loss = (
+                            0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+                        )
 
                     total_loss = config.system.vf_coef * value_loss
                     return total_loss, value_loss
