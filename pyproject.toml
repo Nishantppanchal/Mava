@@ -58,7 +58,7 @@ dependencies = [
   "numpy==1.26.4",
   "omegaconf",
   "optax",
-  "protobuf~=3.20",
+  "protobuf", # unpinned as tensorboard_logger is lazy import now
   "rware",
   "scipy==1.12.0",
   "setuptools",

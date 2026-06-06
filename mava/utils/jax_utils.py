@@ -14,7 +14,7 @@
 
 # TODO: Rewrite this file to handle only JAX arrays.
 
-from typing import Any, Tuple, Union
+from typing import Any, Sequence, Tuple, Union
 
 import chex
 import jax
@@ -81,6 +81,20 @@ def concat_time_and_agents(x: chex.Array) -> chex.Array:
     x = jnp.moveaxis(x, 0, 1)
     x = jnp.reshape(x, (x.shape[0], x.shape[1] * x.shape[2], *x.shape[3:]))
     return x
+
+
+def replicate(x: Any, devices: Sequence[Any]) -> Any:
+    """Replicate a pytree across ``devices`` by adding a leading device axis.
+
+    Each leaf gains a leading axis of size ``len(devices)``; ``jax.pmap`` then
+    maps over that axis, distributing it across the devices. This is the inverse
+    of ``unreplicate_n_dims`` / ``unreplicate_batch_dim``.
+
+    Drop-in for ``flax.jax_utils.replicate`` / ``jax.device_put_replicated``,
+    both of which jax removed in the pmap deprecation.
+    """
+    n = len(devices)
+    return tree.map(lambda leaf: jnp.broadcast_to(leaf, (n, *jnp.shape(leaf))), x)
 
 
 def unreplicate_n_dims(x: Any, unreplicate_depth: int = 2) -> Any:

@@ -17,7 +17,6 @@ import time
 from typing import Any, Tuple
 
 import chex
-import flax
 import hydra
 import jax
 import jax.numpy as jnp
@@ -49,7 +48,7 @@ from mava.types import (
 from mava.utils import make_env as environments
 from mava.utils.checkpointing import Checkpointer
 from mava.utils.config import check_total_timesteps
-from mava.utils.jax_utils import unreplicate_batch_dim, unreplicate_n_dims
+from mava.utils.jax_utils import replicate, unreplicate_batch_dim, unreplicate_n_dims
 from mava.utils.logger import LogEvent, MavaLogger
 from mava.utils.multistep import calculate_gae
 from mava.utils.network_utils import get_action_head
@@ -245,9 +244,11 @@ def get_learner_fn(
                         # optax.huber_loss already includes the 0.5 in its
                         # quadratic region, so do NOT scale by 0.5 again.
                         huber_delta = config.system.get("huber_delta", 1.0)
-                        value_losses = optax.huber_loss(value, targets, huber_delta)
+                        # ``delta`` is keyword-only in optax >=0.2.6; passing it
+                        # positionally breaks there. Keyword form works on all.
+                        value_losses = optax.huber_loss(value, targets, delta=huber_delta)
                         value_losses_clipped = optax.huber_loss(
-                            value_pred_clipped, targets, huber_delta
+                            value_pred_clipped, targets, delta=huber_delta
                         )
                         value_loss = jnp.maximum(value_losses, value_losses_clipped).mean()
                     else:
@@ -411,8 +412,15 @@ def get_learner_fn(
         """
         batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
 
+        # Number of updates per ``learn`` call = the train-metric logging window.
+        # Defaults to the full eval window (one train-log per eval); set
+        # ``system.num_updates_per_log`` to log training metrics more often than
+        # eval (run_experiment splits each eval window into sub-windows).
+        updates_per_call = config.system.get(
+            "num_updates_per_log", config.system.num_updates_per_eval
+        )
         learner_state, (episode_info, loss_info) = jax.lax.scan(
-            batched_update_step, learner_state, None, config.system.num_updates_per_eval
+            batched_update_step, learner_state, None, updates_per_call
         )
         return ExperimentOutput(
             learner_state=learner_state,
@@ -548,7 +556,7 @@ def learner_setup(
     replicate_learner = tree.map(broadcast, replicate_learner)
 
     # Duplicate learner across devices.
-    replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
+    replicate_learner = replicate(replicate_learner, jax.devices())
 
     # Initialise learner state.
     params, opt_states, hstates, step_keys, dones = replicate_learner
@@ -610,13 +618,21 @@ def run_experiment(_config: DictConfig) -> float:
 
     # Calculate number of updates per evaluation.
     config.system.num_updates_per_eval = config.system.num_updates // config.arch.num_evaluation
-    steps_per_rollout = (
+    # Optionally log training metrics more often than eval: split each eval
+    # window into ``num_logs_per_eval`` logged sub-windows; eval still runs once
+    # per window. Defaults to 1 (original behaviour). Set arch.num_logs_per_eval.
+    num_logs_per_eval = max(1, int(config.arch.get("num_logs_per_eval", 1)))
+    config.system.num_updates_per_log = max(
+        1, config.system.num_updates_per_eval // num_logs_per_eval
+    )
+    steps_per_log = (
         n_devices
-        * config.system.num_updates_per_eval
+        * config.system.num_updates_per_log
         * config.system.rollout_length
         * config.system.update_batch_size
         * config.arch.num_envs
     )
+    steps_per_rollout = steps_per_log * num_logs_per_eval
     # Logger setup
     logger = MavaLogger(config)
     logger.log_config(OmegaConf.to_container(config, resolve=True))
@@ -639,30 +655,35 @@ def run_experiment(_config: DictConfig) -> float:
     # Run experiment for a total number of evaluations.
     max_episode_return = -jnp.inf
     best_params = None
+    log_count = 0
     for eval_step in range(config.arch.num_evaluation):
-        # Train.
-        start_time = time.time()
-        learner_output = learn(learner_state)
-        jax.block_until_ready(learner_output)
+        # Train in ``num_logs_per_eval`` sub-windows, logging the training
+        # (ACTOR + TRAINER) metrics after each — more often than eval.
+        for _ in range(num_logs_per_eval):
+            start_time = time.time()
+            learner_output = learn(learner_state)
+            jax.block_until_ready(learner_output)
+            elapsed_time = time.time() - start_time
 
-        # Log the results of the training.
-        elapsed_time = time.time() - start_time
-        t = int(steps_per_rollout * (eval_step + 1))
-        episode_metrics, ep_completed = get_final_step_metrics(learner_output.episode_metrics)
-        episode_metrics["steps_per_second"] = steps_per_rollout / elapsed_time
+            log_count += 1
+            t = int(steps_per_log * log_count)
+            episode_metrics, ep_completed = get_final_step_metrics(
+                learner_output.episode_metrics
+            )
+            episode_metrics["steps_per_second"] = steps_per_log / elapsed_time
 
-        # Separately log timesteps, actoring metrics and training metrics.
-        logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
-        if ep_completed:  # only log episode metrics if an episode was completed in the rollout.
-            logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
-        logger.log(learner_output.train_metrics, t, eval_step, LogEvent.TRAIN)
+            logger.log({"timestep": t}, t, log_count - 1, LogEvent.MISC)
+            if ep_completed:
+                logger.log(episode_metrics, t, log_count - 1, LogEvent.ACT)
+            logger.log(learner_output.train_metrics, t, log_count - 1, LogEvent.TRAIN)
 
-        # Prepare for evaluation.
+            learner_state = learner_output.learner_state
+
+        # Evaluate once per eval window.
         trained_params = unreplicate_batch_dim(learner_state.params.actor_params)
         key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
         eval_keys = jnp.stack(eval_keys)
         eval_keys = eval_keys.reshape(n_devices, -1)
-        # Evaluate.
         eval_metrics = evaluator(trained_params, eval_keys, {"hidden_state": eval_hs})
         logger.log(eval_metrics, t, eval_step, LogEvent.EVAL)
         episode_return = jnp.mean(eval_metrics["episode_return"])
@@ -670,7 +691,7 @@ def run_experiment(_config: DictConfig) -> float:
         if save_checkpoint:
             # Save checkpoint of learner state
             checkpointer.save(
-                timestep=steps_per_rollout * (eval_step + 1),
+                timestep=t,
                 unreplicated_learner_state=unreplicate_n_dims(learner_output.learner_state),
                 episode_return=episode_return,
             )
@@ -678,9 +699,6 @@ def run_experiment(_config: DictConfig) -> float:
         if config.arch.absolute_metric and max_episode_return <= episode_return:
             best_params = copy.deepcopy(trained_params)
             max_episode_return = episode_return
-
-        # Update runner state to continue training.
-        learner_state = learner_output.learner_state
 
     # Record the performance for the final evaluation run.
     eval_performance = float(jnp.mean(eval_metrics[config.env.eval_metric]))

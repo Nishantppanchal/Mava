@@ -170,7 +170,12 @@ class Checkpointer:
         # We want to ensure `major` versions match, but allow `minor` versions to differ
         # i.e. v0.1 and 0.2 are compatible, but v1.0 and v2.0 are not
         # Any breaking API changes should be reflected in the major version
-        assert (self._manager.metadata()["checkpointer_version"] // 1) == (
+        # orbax >= 0.11 returns a ``RootMetadata`` object from ``metadata()`` and
+        # nests user metadata under ``.custom_metadata``; older versions returned
+        # a plain dict. Handle both so checkpoints save/restore across versions.
+        raw_metadata = self._manager.metadata()
+        ckpt_metadata = getattr(raw_metadata, "custom_metadata", raw_metadata)
+        assert (ckpt_metadata["checkpointer_version"] // 1) == (
             CHECKPOINTER_VERSION // 1
         ), "Loaded checkpoint was created with a different major version of the checkpointer."
 
