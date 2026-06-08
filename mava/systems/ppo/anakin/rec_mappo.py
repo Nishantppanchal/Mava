@@ -572,8 +572,14 @@ def learner_setup(
     return learn, actor_network, init_learner_state
 
 
-def run_experiment(_config: DictConfig) -> float:
-    """Runs experiment."""
+def run_experiment(_config: DictConfig, eval_callback=None) -> float:
+    """Runs experiment.
+
+    ``eval_callback`` (optional): called once per evaluation as
+    ``eval_callback(actor_network, actor_params, env_step)`` with the same params
+    the evaluator scored. Opaque to Mava — used by the pursuit entrypoint to log
+    a greedy rollout GIF each eval. None (default) keeps the stock behaviour.
+    """
     _config.logger.system_name = "rec_mappo"
     config = copy.deepcopy(_config)
 
@@ -687,6 +693,12 @@ def run_experiment(_config: DictConfig) -> float:
         eval_metrics = evaluator(trained_params, eval_keys, {"hidden_state": eval_hs})
         logger.log(eval_metrics, t, eval_step, LogEvent.EVAL)
         episode_return = jnp.mean(eval_metrics["episode_return"])
+
+        # Optional render hook: log a greedy rollout GIF for this eval's policy.
+        # ``learner_state.params`` here are the same params the evaluator scored,
+        # so the GIF matches the logged numbers. No-op unless a callback was given.
+        if eval_callback is not None:
+            eval_callback(actor_network, learner_state.params.actor_params, t)
 
         if save_checkpoint:
             # Save checkpoint of learner state
