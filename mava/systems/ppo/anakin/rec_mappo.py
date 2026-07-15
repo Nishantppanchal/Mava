@@ -133,6 +133,27 @@ def get_learner_fn(
             # V(s_{t+1}) on truncation, zero it on termination. ``timestep.reward``
             # already has shape (num_envs, num_agents); discount matches.
             step_discount = timestep.discount
+
+            # V(s_{t+1}) on the TRUE next observation — the other half of the
+            # term-vs-trunc fix. ``AutoResetWrapper`` overwrites
+            # ``timestep.observation`` with the reset observation on any episode
+            # end, so reading the bootstrap off the next transition's value would
+            # feed V(a fresh episode) into the truncation bootstrap that
+            # ``step_discount`` just unmasked. ``extras["real_next_obs"]`` is the
+            # observation actually reached; evaluate it under
+            # ``critic_hidden_state`` (the state AFTER consuming obs_t) with no
+            # done flag, since it continues the same episode. On non-terminal
+            # steps this reproduces the next transition's value exactly.
+            batched_real_next_obs = tree.map(
+                lambda x: x[jnp.newaxis, :], timestep.extras["real_next_obs"]
+            )
+            _, next_val = critic_apply_fn(
+                params.critic_params,
+                critic_hidden_state,
+                (batched_real_next_obs, jnp.zeros_like(last_done)[jnp.newaxis, :]),
+            )
+            next_val = next_val.squeeze(0)
+
             hstates = HiddenStates(policy_hidden_state, critic_hidden_state)
             transition = RNNPPOTransition(
                 last_done,
@@ -147,10 +168,10 @@ def get_learner_fn(
                 params, opt_states, key, env_state, timestep, done, hstates
             )
             metrics = timestep.extras["episode_metrics"] | timestep.extras["env_metrics"]
-            return learner_state, (transition, step_discount, metrics)
+            return learner_state, (transition, step_discount, next_val, metrics)
 
         # Step environment for rollout length
-        learner_state, (traj_batch, discount_traj, episode_metrics) = jax.lax.scan(
+        learner_state, (traj_batch, discount_traj, next_val_traj, episode_metrics) = jax.lax.scan(
             _env_step, learner_state, None, config.system.rollout_length
         )
 
@@ -165,6 +186,9 @@ def get_learner_fn(
         _, last_val = critic_apply_fn(params.critic_params, hstates.critic_hidden_state, ac_in)
 
         # Squeeze out the batch dimension and mask out the value of terminal states.
+        # NOTE: unused by the ``next_val_traj`` path of ``calculate_gae`` — which
+        # carries the bootstrap for every step, the last one included — but still
+        # computed to keep the rollout-boundary hidden state advancing as before.
         last_val = last_val.squeeze(0)
 
         advantages, targets = calculate_gae(
@@ -174,6 +198,7 @@ def get_learner_fn(
             config.system.gamma,
             config.system.gae_lambda,
             discount_traj=discount_traj,
+            next_val_traj=next_val_traj,
         )
 
         def _update_epoch(update_state: Tuple, _: Any) -> Tuple:
