@@ -134,16 +134,25 @@ def get_learner_fn(
             # already has shape (num_envs, num_agents); discount matches.
             step_discount = timestep.discount
 
-            # The TRUE next observation, kept for the term-vs-trunc bootstrap.
-            # ``AutoResetWrapper`` overwrites ``timestep.observation`` with the
-            # reset observation on any episode end, so reading the bootstrap off
-            # the next transition's value would feed V(a fresh episode) into the
-            # truncation bootstrap that ``step_discount`` just unmasked.
-            # ``extras["real_next_obs"]`` is the observation actually reached.
-            # Only STORED here — the critic runs on it after the scan (see below),
-            # since evaluating it in-scan puts a third network round-trip inside
-            # every one of the ``rollout_length`` sequential iterations.
-            real_next_obs = timestep.extras["real_next_obs"]
+            # V(s_{t+1}) on the TRUE next observation — the other half of the
+            # term-vs-trunc fix. ``AutoResetWrapper`` overwrites
+            # ``timestep.observation`` with the reset observation on any episode
+            # end, so reading the bootstrap off the next transition's value would
+            # feed V(a fresh episode) into the truncation bootstrap that
+            # ``step_discount`` just unmasked. ``extras["real_next_obs"]`` is the
+            # observation actually reached; evaluate it under
+            # ``critic_hidden_state`` (the state AFTER consuming obs_t) with no
+            # done flag, since it continues the same episode. On non-terminal
+            # steps this reproduces the next transition's value exactly.
+            batched_real_next_obs = tree.map(
+                lambda x: x[jnp.newaxis, :], timestep.extras["real_next_obs"]
+            )
+            _, next_val = critic_apply_fn(
+                params.critic_params,
+                critic_hidden_state,
+                (batched_real_next_obs, jnp.zeros_like(last_done)[jnp.newaxis, :]),
+            )
+            next_val = next_val.squeeze(0)
 
             hstates = HiddenStates(policy_hidden_state, critic_hidden_state)
             transition = RNNPPOTransition(
@@ -159,11 +168,11 @@ def get_learner_fn(
                 params, opt_states, key, env_state, timestep, done, hstates
             )
             metrics = timestep.extras["episode_metrics"] | timestep.extras["env_metrics"]
-            return learner_state, (transition, step_discount, real_next_obs, metrics)
+            return learner_state, (transition, step_discount, next_val, metrics)
 
         # Step environment for rollout length
-        learner_state, (traj_batch, discount_traj, real_next_obs_traj, episode_metrics) = (
-            jax.lax.scan(_env_step, learner_state, None, config.system.rollout_length)
+        learner_state, (traj_batch, discount_traj, next_val_traj, episode_metrics) = jax.lax.scan(
+            _env_step, learner_state, None, config.system.rollout_length
         )
 
         # Calculate advantage
@@ -181,37 +190,6 @@ def get_learner_fn(
         # carries the bootstrap for every step, the last one included — but still
         # computed to keep the rollout-boundary hidden state advancing as before.
         last_val = last_val.squeeze(0)
-
-        # V(s_{t+1}) on the true next observations — the other half of the
-        # term-vs-trunc fix (see ``calculate_gae``). Done in ONE batched forward
-        # rather than inside ``_env_step``: these values have no sequential
-        # dependency on each other, so folding time into the batch turns
-        # ``rollout_length`` latency-bound round-trips into a single parallel one.
-        # The rollout scan is a few percent of the FLOPs but is launch-latency
-        # bound, so an in-scan third forward cost ~27% of wall-clock against ~2%
-        # of the arithmetic.
-        #
-        # Each value needs the critic state AFTER consuming obs_t. The scan feeds
-        # every step's output hidden state in as the next step's input, so that is
-        # exactly ``last_hstates[t+1]`` — already in the trajectory, shifted by
-        # one — with the final step's coming from the terminal ``learner_state``.
-        # No extra storage, and no reset flag: real_next_obs continues the episode
-        # obs_t belongs to.
-        post_critic_hstate = jnp.concatenate(
-            [traj_batch.hstates.critic_hidden_state[1:], hstates.critic_hidden_state[jnp.newaxis]],
-            axis=0,
-        )  # (T, num_envs, num_agents, hidden)
-        t_len = config.system.rollout_length
-        n_env = config.arch.num_envs
-        flat_real_next_obs = tree.map(
-            lambda x: x.reshape(1, t_len * n_env, *x.shape[2:]), real_next_obs_traj
-        )
-        _, next_val_traj = critic_apply_fn(
-            params.critic_params,
-            post_critic_hstate.reshape(t_len * n_env, *post_critic_hstate.shape[2:]),
-            (flat_real_next_obs, jnp.zeros((1, t_len * n_env, env.num_agents), dtype=bool)),
-        )
-        next_val_traj = next_val_traj.reshape(t_len, n_env, env.num_agents)
 
         advantages, targets = calculate_gae(
             traj_batch,
