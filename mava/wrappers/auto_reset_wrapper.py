@@ -19,6 +19,7 @@ from typing import Tuple
 
 import chex
 import jax
+import jax.numpy as jnp
 from jumanji.env import State
 from jumanji.types import TimeStep
 from jumanji.wrappers import Observation, Wrapper
@@ -86,16 +87,40 @@ class AutoResetWrapper(Wrapper):
         return self._obs_in_extras(*super().reset(key))
 
     def step(self, state: State, action: chex.Array) -> Tuple[State, TimeStep[Observation]]:
-        """Step the environment, with automatic resetting if the episode terminates."""
+        """Step the environment, with automatic resetting if the episode terminates.
+
+        NOTE: implemented as unconditional-reset + per-leaf ``jnp.where`` select
+        rather than ``jax.lax.cond``. Under ``jax.vmap`` (Anakin), a cond with a
+        batched predicate executes both branches anyway, so this is semantically
+        identical — but JAX's cond BATCHING RULE also broadcasts the branches'
+        closure constants into batched operands. With an env that closes over a
+        large lookup table that broadcast is catastrophic: the pursuit env's
+        compact BFS table (1.07 GiB at G=200) was tiled x num_envs into a
+        136.56 GiB ``u16[128,571975056]`` buffer inside the rollout while-loop.
+        The select form keeps constants unbatched. See the pursuit repo's
+        DESIGN.md §30.
+        """
         state, timestep = self._env.step(state, action)
 
-        # Overwrite the state and timestep appropriately if the episode terminates.
-        state, timestep = jax.lax.cond(
-            timestep.last(),
-            self._auto_reset,
-            self._obs_in_extras,
-            state,
-            timestep,
+        # Both paths of the old cond stored the pre-reset observation in extras.
+        state, timestep = self._obs_in_extras(state, timestep)
+
+        # Unconditional reset (same key discipline as the old _auto_reset), then
+        # select per leaf. Under vmap `done` is a scalar per environment, so the
+        # where broadcasts over every leaf shape.
+        key, _ = jax.random.split(state.key)  # type: ignore
+        reset_state, reset_timestep = self._env.reset(key)
+
+        done = timestep.last()
+
+        def select(r: chex.Array, s: chex.Array) -> chex.Array:
+            return jnp.where(done, r, s)
+
+        state = jax.tree_util.tree_map(select, reset_state, state)
+        timestep = timestep.replace(  # type: ignore
+            observation=jax.tree_util.tree_map(
+                select, reset_timestep.observation, timestep.observation
+            )
         )
 
         return state, timestep
