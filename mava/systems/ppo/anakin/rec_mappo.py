@@ -541,13 +541,21 @@ def learner_setup(
 
     # Load model from checkpoint if specified.
     if config.logger.checkpointing.load_model:
+        load_args = dict(config.logger.checkpointing.load_args)
+        # Optional load_args.timestep: restore a SPECIFIC saved step (e.g. the
+        # best-eval checkpoint) instead of the latest kept one. Popped here —
+        # it is a restore_params() argument, not a Checkpointer kwarg.
+        load_timestep = load_args.pop("timestep", None)
         loaded_checkpoint = Checkpointer(
             model_name=config.logger.system_name,
-            **config.logger.checkpointing.load_args,  # Other checkpoint args
+            **load_args,  # Other checkpoint args
         )
         # Restore the learner state from the checkpoint
         restored_params, restored_hstates = loaded_checkpoint.restore_params(
-            input_params=params, restore_hstates=True, THiddenState=HiddenStates
+            input_params=params,
+            timestep=load_timestep,
+            restore_hstates=True,
+            THiddenState=HiddenStates,
         )
         # Update the params and hstates
         params = restored_params
