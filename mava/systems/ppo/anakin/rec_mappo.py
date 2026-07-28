@@ -557,9 +557,19 @@ def learner_setup(
             restore_hstates=True,
             THiddenState=HiddenStates,
         )
-        # Update the params and hstates
+        # Update the params and hstates. Restored hidden states carry the
+        # SOURCE run's batch dimensions (num_envs etc.); if the current run's
+        # differ (e.g. warm-starting a 128-env checkpoint at 256 envs), keep
+        # the freshly initialised hstates instead — they are transient
+        # per-episode context, not learned state.
         params = restored_params
-        hstates = restored_hstates if restored_hstates else hstates
+        if restored_hstates is not None:
+            fresh_shapes = jax.tree_util.tree_map(lambda x: x.shape, hstates)
+            restored_shapes = jax.tree_util.tree_map(
+                lambda x: x.shape, restored_hstates
+            )
+            if fresh_shapes == restored_shapes:
+                hstates = restored_hstates
 
     # Initialise environment states and timesteps: across devices and batches.
     key, *env_keys = jax.random.split(
