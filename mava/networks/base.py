@@ -150,12 +150,23 @@ class ScannedRNN(nn.Module):
 
 
 class RecurrentActor(nn.Module):
-    """Recurrent Actor Network."""
+    """Recurrent Actor Network.
+
+    Fork §51: ``temporal_core`` selects the memory module — "gru" (stock
+    ScannedRNN, default; zero behavior change) or "window_attention"
+    (ScannedWindowAttention; ``hidden_state_dim`` must then equal
+    attn_window * (attn_token_dim + 1) so zero-carry init sites work
+    unchanged).
+    """
 
     pre_torso: nn.Module
     post_torso: nn.Module
     action_head: nn.Module
     hidden_state_dim: int = 128
+    temporal_core: str = "gru"
+    attn_token_dim: int = 128
+    attn_window: int = 64
+    attn_heads: int = 4
 
     @nn.compact
     def __call__(
@@ -175,9 +186,17 @@ class RecurrentActor(nn.Module):
             action_mask = observation.action_mask
 
         policy_rnn_input = (policy_embedding, done)
-        policy_hidden_state, policy_embedding = ScannedRNN(self.hidden_state_dim)(
-            policy_hidden_state, policy_rnn_input
-        )
+        if self.temporal_core == "window_attention":
+            policy_hidden_state, policy_embedding = ScannedWindowAttention(
+                hidden_state_dim=self.hidden_state_dim,
+                token_dim=self.attn_token_dim,
+                window=self.attn_window,
+                n_heads=self.attn_heads,
+            )(policy_hidden_state, policy_rnn_input)
+        else:
+            policy_hidden_state, policy_embedding = ScannedRNN(self.hidden_state_dim)(
+                policy_hidden_state, policy_rnn_input
+            )
         policy_embedding = self.post_torso(policy_embedding)
         pi = self.action_head(policy_embedding, action_mask)
 
@@ -341,3 +360,70 @@ class QMixingNetwork(nn.Module):
         q_tot = jnp.reshape(y, (B, T, 1))
 
         return q_tot
+
+
+class ScannedWindowAttention(nn.Module):
+    """Sliding-window temporal attention cell — a GRU-replacement (fork §51).
+
+    Same outer interface as ``ScannedRNN`` (scan over (embedding, done);
+    carry created by zeros of ``hidden_state_dim``): the carry is a FLAT
+    ``(B, N, window * (token_dim + 1))`` array packing a KV cache of the
+    last ``window`` input tokens plus a per-slot validity mask, so
+    ``ScannedRNN.initialize_carry`` (zeros == empty memory) works unchanged
+    at every call site. Each step: project the input to ``token_dim``,
+    attend (with learned slot-position embeddings, newest slot last) over
+    the valid cached tokens + the current token, residual + LayerNorm +
+    FFN, emit; then roll the cache. ``done`` zeroes the cache (episode
+    reset), matching GRU reset semantics. Causality is inherent to the
+    scan. ``hidden_state_dim`` MUST equal ``window * (token_dim + 1)`` —
+    asserted at call time.
+    """
+
+    hidden_state_dim: int = 8256
+    token_dim: int = 128
+    window: int = 64
+    n_heads: int = 4
+
+    @functools.partial(
+        nn.scan,
+        variable_broadcast="params",
+        in_axes=0,
+        out_axes=0,
+        split_rngs={"params": False},
+    )
+    @nn.compact
+    def __call__(self, carry: chex.Array, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
+        ins, resets = x
+        M, d = self.window, self.token_dim
+        assert self.hidden_state_dim == M * (d + 1), (
+            f"hidden_state_dim must be window*(token_dim+1) = {M * (d + 1)}, "
+            f"got {self.hidden_state_dim}"
+        )
+        carry = jnp.where(resets[:, :, jnp.newaxis], jnp.zeros_like(carry), carry)
+        lead = carry.shape[:-1]  # (B, N)
+        buffer = carry[..., : M * d].reshape(*lead, M, d)
+        valid = carry[..., M * d :]  # (B, N, M)
+
+        tok = nn.Dense(d)(ins)  # (B, N, d)
+        pos = self.param(
+            "pos_emb", nn.initializers.normal(0.02), (M + 1, d)
+        )
+        kv = jnp.concatenate([buffer, tok[..., None, :]], axis=-2) + pos
+        kv_valid = jnp.concatenate(
+            [valid, jnp.ones((*lead, 1), valid.dtype)], axis=-1
+        )  # (B, N, M+1)
+        attn_mask = kv_valid[..., None, None, :] > 0.5  # (B, N, 1, 1, M+1)
+        attended = nn.MultiHeadDotProductAttention(
+            num_heads=self.n_heads, qkv_features=d
+        )(tok[..., None, :], kv, mask=attn_mask)[..., 0, :]
+        y = nn.LayerNorm()(tok + attended)
+        y = nn.LayerNorm()(y + nn.Dense(d)(nn.relu(nn.Dense(2 * d)(y))))
+
+        new_buffer = jnp.concatenate([buffer[..., 1:, :], tok[..., None, :]], axis=-2)
+        new_valid = jnp.concatenate(
+            [valid[..., 1:], jnp.ones((*lead, 1), valid.dtype)], axis=-1
+        )
+        new_carry = jnp.concatenate(
+            [new_buffer.reshape(*lead, M * d), new_valid], axis=-1
+        )
+        return new_carry, y
