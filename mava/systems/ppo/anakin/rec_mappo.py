@@ -218,9 +218,20 @@ def get_learner_fn(
                     """Calculate the actor loss."""
                     # Rerun network
                     obs_and_done = (traj_batch.obs, traj_batch.done)
-                    _, actor_policy = actor_apply_fn(
-                        actor_params, traj_batch.hstates.policy_hidden_state[0], obs_and_done
-                    )
+                    aux_coef = config.system.get("aux_predict_coef", 0.0)
+                    if aux_coef:
+                        # Fork §53: pull the sown aux evader prediction.
+                        ((_, actor_policy), inters) = actor_apply_fn(
+                            actor_params,
+                            traj_batch.hstates.policy_hidden_state[0],
+                            obs_and_done,
+                            mutable=["intermediates"],
+                        )
+                        aux_pred = inters["intermediates"]["aux_evader_pred"][0]
+                    else:
+                        _, actor_policy = actor_apply_fn(
+                            actor_params, traj_batch.hstates.policy_hidden_state[0], obs_and_done
+                        )
                     log_prob = actor_policy.log_prob(traj_batch.action)
 
                     # Calculate actor loss
@@ -242,7 +253,24 @@ def get_learner_fn(
                     entropy = actor_policy.entropy(seed=key).mean()
 
                     total_loss = actor_loss - config.system.ent_coef * entropy
-                    return total_loss, (actor_loss, entropy)
+                    aux_mse = jnp.float32(0.0)
+                    if aux_coef:
+                        # Fork §53: supervised aux loss — predict the TRUE
+                        # evader position (global_state[..., 0:2], hindsight)
+                        # ``k`` steps ahead. Valid where no episode boundary
+                        # sits in (t, t+k]: done-count difference via cumsum.
+                        k = int(config.system.get("aux_predict_horizon", 8))
+                        gs = traj_batch.obs.global_state[..., 0:2]  # (T,B,N,2)
+                        dcum = jnp.cumsum(
+                            traj_batch.done.astype(jnp.float32), axis=0
+                        )
+                        tgt = gs[k:]  # (T-k, B, N, 2)
+                        pred = aux_pred[:-k]
+                        valid = (dcum[k:] - dcum[:-k]) == 0.0  # (T-k, B, N)
+                        se = jnp.sum((pred - tgt) ** 2, axis=-1)
+                        aux_mse = jnp.sum(se * valid) / (jnp.sum(valid) + 1e-8)
+                        total_loss = total_loss + aux_coef * aux_mse
+                    return total_loss, (actor_loss, entropy, aux_mse)
 
                 def _critic_loss_fn(
                     critic_params: FrozenDict,
@@ -334,7 +362,7 @@ def get_learner_fn(
                 new_params = Params(actor_new_params, critic_new_params)
                 new_opt_state = OptStates(actor_new_opt_state, critic_new_opt_state)
 
-                actor_loss, (_, entropy) = actor_loss_info
+                actor_loss, (_, entropy, aux_mse) = actor_loss_info
                 value_loss, unscaled_value_loss = value_loss_info
 
                 total_loss = actor_loss + value_loss
@@ -343,6 +371,8 @@ def get_learner_fn(
                     "value_loss": unscaled_value_loss,
                     "actor_loss": actor_loss,
                     "entropy": entropy,
+                    # Fork §53: 0.0 unless system.aux_predict_coef is set.
+                    "aux_predict_loss": aux_mse,
                 }
 
                 return (new_params, new_opt_state, entropy_key), loss_info
@@ -488,6 +518,8 @@ def learner_setup(
         attn_token_dim=config.network.get("attn_token_dim", 128),
         attn_window=config.network.get("attn_window", 64),
         attn_heads=config.network.get("attn_heads", 4),
+        # Fork §53: aux evader-prediction head, on iff the loss uses it.
+        aux_predict=bool(config.system.get("aux_predict_coef", 0.0)),
     )
     critic_network = Critic(
         pre_torso=critic_pre_torso,

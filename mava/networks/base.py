@@ -157,6 +157,15 @@ class RecurrentActor(nn.Module):
     (ScannedWindowAttention; ``hidden_state_dim`` must then equal
     attn_window * (attn_token_dim + 1) so zero-carry init sites work
     unchanged).
+
+    Fork §53: ``aux_predict`` adds an auxiliary evader-position head off the
+    temporal core (Dense(2) on the recurrent embedding), exposed ONLY via
+    flax's "intermediates" sow — the (hstate, pi) return contract is
+    untouched, so every existing consumer (evaluator, render, BC, eval
+    scripts) is unaffected; the PPO loss opts in with
+    ``mutable=["intermediates"]`` and trains it supervised on the true
+    future evader position (dense hindsight signal shaping the shared
+    representation toward route prediction).
     """
 
     pre_torso: nn.Module
@@ -167,6 +176,7 @@ class RecurrentActor(nn.Module):
     attn_token_dim: int = 128
     attn_window: int = 64
     attn_heads: int = 4
+    aux_predict: bool = False
 
     @nn.compact
     def __call__(
@@ -197,6 +207,11 @@ class RecurrentActor(nn.Module):
             policy_hidden_state, policy_embedding = ScannedRNN(self.hidden_state_dim)(
                 policy_hidden_state, policy_rnn_input
             )
+        if self.aux_predict:
+            # §53 aux head reads the CORE output (pre post-torso) so the
+            # gradient shapes the recurrent representation itself.
+            aux = nn.Dense(2, name="aux_evader_head")(policy_embedding)
+            self.sow("intermediates", "aux_evader_pred", aux)
         policy_embedding = self.post_torso(policy_embedding)
         pi = self.action_head(policy_embedding, action_mask)
 
@@ -391,6 +406,11 @@ class ScannedWindowAttention(nn.Module):
         out_axes=0,
         split_rngs={"params": False},
     )
+    # Fork §53: scan-over-remat. Without it, BPTT stores every step's
+    # attention internals — a single ~10GB residual buffer at 128 envs
+    # (observed OOM). Remat recomputes the cell in the backward pass from
+    # (carry, input) instead; memory drops ~T-fold for ~30% extra compute.
+    @nn.remat
     @nn.compact
     def __call__(self, carry: chex.Array, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
         ins, resets = x
