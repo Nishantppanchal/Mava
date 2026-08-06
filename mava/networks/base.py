@@ -203,6 +203,11 @@ class RecurrentActor(nn.Module):
                 window=self.attn_window,
                 n_heads=self.attn_heads,
             )(policy_hidden_state, policy_rnn_input)
+        elif self.temporal_core == "ssm":
+            # Fork §53: diagonal gated selective SSM (Mamba-lineage).
+            policy_hidden_state, policy_embedding = ScannedSSM(
+                hidden_state_dim=self.hidden_state_dim
+            )(policy_hidden_state, policy_rnn_input)
         else:
             policy_hidden_state, policy_embedding = ScannedRNN(self.hidden_state_dim)(
                 policy_hidden_state, policy_rnn_input
@@ -447,3 +452,47 @@ class ScannedWindowAttention(nn.Module):
             [new_buffer.reshape(*lead, M * d), new_valid], axis=-1
         )
         return new_carry, y
+
+
+class ScannedSSM(nn.Module):
+    """Diagonal gated selective SSM cell — a GRU replacement (fork §53).
+
+    Mamba-lineage recurrence in ``ScannedRNN``'s exact interface: the carry
+    is the flat ``(B, N, hidden_state_dim)`` diagonal state (zeros == empty
+    memory, so every ``initialize_carry`` site works unchanged) and ``done``
+    zeroes it. Per step, input-dependent (selective) step sizes modulate a
+    learned stable per-channel decay:
+
+        dt = softplus(W_dt x)                    input-dependent step size
+        a  = exp(-softplus(A_log) * dt)          decay in (0, 1)
+        h' = a * h + (1 - a) * (W_in x)          ZOH-style state update
+        y  = LayerNorm(h' * silu(W_gate x))      gated readout
+
+    Output width == ``hidden_state_dim`` (the GRU convention), so post-torsos
+    and all hstate plumbing are untouched. Per-step internals are O(S) — no
+    remat needed (nothing like the attention cell's window buffers).
+    """
+
+    hidden_state_dim: int = 128
+
+    @functools.partial(
+        nn.scan,
+        variable_broadcast="params",
+        in_axes=0,
+        out_axes=0,
+        split_rngs={"params": False},
+    )
+    @nn.compact
+    def __call__(self, carry: chex.Array, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
+        ins, resets = x
+        carry = jnp.where(resets[:, :, jnp.newaxis], jnp.zeros_like(carry), carry)
+        s = self.hidden_state_dim
+        assert carry.shape[-1] == s, (
+            f"ScannedSSM carry width {carry.shape[-1]} != hidden_state_dim {s}"
+        )
+        dt = jax.nn.softplus(nn.Dense(s, name="dt_proj")(ins))
+        a_log = self.param("A_log", nn.initializers.normal(0.5), (s,))
+        a = jnp.exp(-jax.nn.softplus(a_log) * dt)
+        h = a * carry + (1.0 - a) * nn.Dense(s, name="in_proj")(ins)
+        y = nn.LayerNorm()(h * jax.nn.silu(nn.Dense(s, name="gate_proj")(ins)))
+        return h, y
