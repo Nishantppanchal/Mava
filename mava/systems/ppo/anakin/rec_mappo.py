@@ -56,6 +56,24 @@ from mava.utils.training import make_learning_rate
 from mava.wrappers.episode_metrics import get_final_step_metrics
 
 
+def _adaptive_ent_coef(
+    base: float, entropy: chex.Array, target: Any, gain: float
+) -> chex.Array:
+    """Fork §60: target-entropy control for the entropy bonus.
+
+    Fixed coefficients are bistable on wide policies (at 2x width,
+    0.0005 collapses entropy to ~0.22 while 0.002 diverges through 0.9):
+    strengthen the bonus exponentially below ``target`` and weaken it
+    above. Stateless — a pure function of the current batch — so
+    checkpoints, warm-starts, and the learner-state pytree are
+    unaffected. ``target=None`` reduces to the constant ``base``.
+    """
+    if target is None:
+        return jnp.asarray(base)
+    mult = jnp.exp(gain * (target - jax.lax.stop_gradient(entropy)))
+    return base * jnp.clip(mult, 0.05, 20.0)
+
+
 def get_learner_fn(
     env: MarlEnv,
     apply_fns: Tuple[RecActorApply, RecCriticApply],
@@ -252,7 +270,13 @@ def get_learner_fn(
                     # The seed will be used in the TanhTransformedDistribution:
                     entropy = actor_policy.entropy(seed=key).mean()
 
-                    total_loss = actor_loss - config.system.ent_coef * entropy
+                    ent_coef = _adaptive_ent_coef(
+                        config.system.ent_coef,
+                        entropy,
+                        config.system.get("ent_target", None),
+                        config.system.get("ent_target_gain", 7.0),
+                    )
+                    total_loss = actor_loss - ent_coef * entropy
                     aux_mse = jnp.float32(0.0)
                     if aux_coef:
                         # Fork §53: supervised aux loss — predict the TRUE
