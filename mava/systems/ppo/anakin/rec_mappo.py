@@ -74,8 +74,11 @@ def _adaptive_ent_coef(base: float, entropy: chex.Array, target: Any, gain: floa
     if target is None:
         return jnp.asarray(base)
     h = jax.lax.stop_gradient(entropy)
+    # Continuous at the target (both branches equal ``base`` there): below,
+    # the §60 exponential boost; above, a linear descent through zero into
+    # the penalty region, crossing at h = target + 1/gain.
     boost = base * jnp.clip(jnp.exp(gain * (target - h)), 1.0, 20.0)
-    penalty = -base * jnp.clip(gain * (h - target), 0.0, 20.0)
+    penalty = base * jnp.clip(1.0 - gain * (h - target), -20.0, 1.0)
     return jnp.where(h < target, boost, penalty)
 
 
