@@ -56,22 +56,27 @@ from mava.utils.training import make_learning_rate
 from mava.wrappers.episode_metrics import get_final_step_metrics
 
 
-def _adaptive_ent_coef(
-    base: float, entropy: chex.Array, target: Any, gain: float
-) -> chex.Array:
-    """Fork §60: target-entropy control for the entropy bonus.
+def _adaptive_ent_coef(base: float, entropy: chex.Array, target: Any, gain: float) -> chex.Array:
+    """Fork §60/§64e: SIGNED target-entropy control for the entropy bonus.
 
-    Fixed coefficients are bistable on wide policies (at 2x width,
-    0.0005 collapses entropy to ~0.22 while 0.002 diverges through 0.9):
-    strengthen the bonus exponentially below ``target`` and weaken it
-    above. Stateless — a pure function of the current batch — so
-    checkpoints, warm-starts, and the learner-state pytree are
-    unaffected. ``target=None`` reduces to the constant ``base``.
+    Fixed coefficients are bistable on wide policies and runaway-prone in
+    flat-advantage regimes (§64d: long search phases let even a floored
+    bonus drift entropy to ~1.4 and dissolve the policy). Below ``target``
+    the bonus is boosted exponentially (the proven §60 half); ABOVE target
+    the coefficient goes NEGATIVE — an active entropy penalty proportional
+    to the excess — because zeroing the bonus alone has no authority when
+    the surrogate itself is flat. Stateless — a pure function of the
+    current batch — so checkpoints, warm-starts, and the learner-state
+    pytree are unaffected. ``target=None`` reduces to the constant
+    ``base``. (§60b's gen3w-ext ran the unsigned v1 semantics: floor 0.05
+    instead of the negative branch.)
     """
     if target is None:
         return jnp.asarray(base)
-    mult = jnp.exp(gain * (target - jax.lax.stop_gradient(entropy)))
-    return base * jnp.clip(mult, 0.05, 20.0)
+    h = jax.lax.stop_gradient(entropy)
+    boost = base * jnp.clip(jnp.exp(gain * (target - h)), 1.0, 20.0)
+    penalty = -base * jnp.clip(gain * (h - target), 0.0, 20.0)
+    return jnp.where(h < target, boost, penalty)
 
 
 def get_learner_fn(
@@ -285,9 +290,7 @@ def get_learner_fn(
                         # sits in (t, t+k]: done-count difference via cumsum.
                         k = int(config.system.get("aux_predict_horizon", 8))
                         gs = traj_batch.obs.global_state[..., 0:2]  # (T,B,N,2)
-                        dcum = jnp.cumsum(
-                            traj_batch.done.astype(jnp.float32), axis=0
-                        )
+                        dcum = jnp.cumsum(traj_batch.done.astype(jnp.float32), axis=0)
                         tgt = gs[k:]  # (T-k, B, N, 2)
                         pred = aux_pred[:-k]
                         valid = (dcum[k:] - dcum[:-k]) == 0.0  # (T-k, B, N)
@@ -331,9 +334,7 @@ def get_learner_fn(
                     else:
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = (
-                            0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
-                        )
+                        value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
 
                     total_loss = config.system.vf_coef * value_loss
                     return total_loss, value_loss
@@ -631,9 +632,7 @@ def learner_setup(
         params = restored_params
         if restored_hstates is not None:
             fresh_shapes = jax.tree_util.tree_map(lambda x: x.shape, hstates)
-            restored_shapes = jax.tree_util.tree_map(
-                lambda x: x.shape, restored_hstates
-            )
+            restored_shapes = jax.tree_util.tree_map(lambda x: x.shape, restored_hstates)
             if fresh_shapes == restored_shapes:
                 hstates = restored_hstates
 
@@ -698,13 +697,13 @@ def run_experiment(_config: DictConfig, eval_callback=None) -> float:
     if config.system.recurrent_chunk_size is None:
         config.system.recurrent_chunk_size = config.system.rollout_length
     else:
-        assert (
-            config.system.rollout_length % config.system.recurrent_chunk_size == 0
-        ), "Rollout length must be divisible by recurrent chunk size."
+        assert config.system.rollout_length % config.system.recurrent_chunk_size == 0, (
+            "Rollout length must be divisible by recurrent chunk size."
+        )
 
-        assert (
-            config.arch.num_envs % config.system.num_minibatches == 0
-        ), "Number of envs must be divisibile by number of minibatches."
+        assert config.arch.num_envs % config.system.num_minibatches == 0, (
+            "Number of envs must be divisibile by number of minibatches."
+        )
 
     # Create the enviroments for train and eval.
     env, eval_env = environments.make(config=config, add_global_state=True)
@@ -727,9 +726,9 @@ def run_experiment(_config: DictConfig, eval_callback=None) -> float:
 
     # Calculate total timesteps.
     config = check_total_timesteps(config)
-    assert (
-        config.system.num_updates > config.arch.num_evaluation
-    ), "Number of updates per evaluation must be less than total number of updates."
+    assert config.system.num_updates > config.arch.num_evaluation, (
+        "Number of updates per evaluation must be less than total number of updates."
+    )
 
     # Calculate number of updates per evaluation.
     config.system.num_updates_per_eval = config.system.num_updates // config.arch.num_evaluation
@@ -782,9 +781,7 @@ def run_experiment(_config: DictConfig, eval_callback=None) -> float:
 
             log_count += 1
             t = int(steps_per_log * log_count)
-            episode_metrics, ep_completed = get_final_step_metrics(
-                learner_output.episode_metrics
-            )
+            episode_metrics, ep_completed = get_final_step_metrics(learner_output.episode_metrics)
             episode_metrics["steps_per_second"] = steps_per_log / elapsed_time
 
             logger.log({"timestep": t}, t, log_count - 1, LogEvent.MISC)
