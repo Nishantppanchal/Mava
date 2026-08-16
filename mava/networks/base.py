@@ -208,6 +208,11 @@ class RecurrentActor(nn.Module):
             policy_hidden_state, policy_embedding = ScannedSSM(
                 hidden_state_dim=self.hidden_state_dim
             )(policy_hidden_state, policy_rnn_input)
+        elif self.temporal_core == "dual_gru":
+            # Fork §80: phase-gated dual-timescale GRU (see ScannedDualGRU).
+            policy_hidden_state, policy_embedding = ScannedDualGRU(
+                hidden_state_dim=self.hidden_state_dim
+            )(policy_hidden_state, policy_rnn_input)
         else:
             policy_hidden_state, policy_embedding = ScannedRNN(self.hidden_state_dim)(
                 policy_hidden_state, policy_rnn_input
@@ -496,3 +501,51 @@ class ScannedSSM(nn.Module):
         h = a * carry + (1.0 - a) * nn.Dense(s, name="in_proj")(ins)
         y = nn.LayerNorm()(h * jax.nn.silu(nn.Dense(s, name="gate_proj")(ins)))
         return h, y
+
+
+class ScannedDualGRU(nn.Module):
+    """Phase-gated dual-timescale GRU — a GRU replacement (fork §80).
+
+    Two half-width GRU cells in ``ScannedRNN``'s exact interface. The FAST
+    core updates every step (reactive chase geometry). The SLOW core's update
+    is per-unit gated by a learned, input-conditioned rate g in (0, 1) — an
+    adaptive-timescale (leaky) recurrence that can hold search-phase memory
+    across hundreds of steps while the fast core churns. The gate reads the
+    observation embedding, which carries the contact-phase signal
+    (fused-sighting validity), so the network can learn to run the slow core
+    open during search and nearly frozen in-chase — the two-phase task
+    anatomy (§71/§74) expressed as architecture. Gate bias -2 initialises
+    slow-core rates near 0.12 (~8-step timescale), learnable per unit.
+
+    Carry = concat(h_fast, h_slow), width == ``hidden_state_dim``, zeros ==
+    empty memory — every ``initialize_carry`` site and done-reset works
+    unchanged; output width matches the GRU convention so post-torsos and
+    hstate plumbing are untouched.
+    """
+
+    hidden_state_dim: int = 128
+
+    @functools.partial(
+        nn.scan,
+        variable_broadcast="params",
+        in_axes=0,
+        out_axes=0,
+        split_rngs={"params": False},
+    )
+    @nn.compact
+    def __call__(self, carry: chex.Array, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
+        ins, resets = x
+        carry = jnp.where(resets[:, :, jnp.newaxis], jnp.zeros_like(carry), carry)
+        s = self.hidden_state_dim
+        assert s % 2 == 0, f"dual_gru needs an even hidden_state_dim, got {s}"
+        assert carry.shape[-1] == s, (
+            f"ScannedDualGRU carry width {carry.shape[-1]} != hidden_state_dim {s}"
+        )
+        half = s // 2
+        h_fast, h_slow = carry[..., :half], carry[..., half:]
+        new_fast, _ = nn.GRUCell(features=half, name="fast")(h_fast, ins)
+        cand_slow, _ = nn.GRUCell(features=half, name="slow")(h_slow, ins)
+        g = jax.nn.sigmoid(nn.Dense(half, name="rate_gate")(ins) - 2.0)
+        new_slow = (1.0 - g) * h_slow + g * cand_slow
+        new_carry = jnp.concatenate([new_fast, new_slow], axis=-1)
+        return new_carry, new_carry
