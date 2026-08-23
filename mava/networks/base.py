@@ -152,11 +152,11 @@ class ScannedRNN(nn.Module):
 class RecurrentActor(nn.Module):
     """Recurrent Actor Network.
 
-    Fork §51: ``temporal_core`` selects the memory module — "gru" (stock
-    ScannedRNN, default; zero behavior change) or "window_attention"
-    (ScannedWindowAttention; ``hidden_state_dim`` must then equal
-    attn_window * (attn_token_dim + 1) so zero-carry init sites work
-    unchanged).
+    Fork §51/§97: ``temporal_core`` selects the memory module — "gru"
+    (stock ScannedRNN, default; zero behavior change) or "dual_gru"
+    (ScannedDualGRU, the §80 phase-gated dual-timescale core). The §51/§53
+    window-attention and SSM cores were removed in §97 (both closed
+    negative, DESIGN §80/§82b) — git history has them.
 
     Fork §53: ``aux_predict`` adds an auxiliary evader-position head off the
     temporal core (Dense(2) on the recurrent embedding), exposed ONLY via
@@ -173,9 +173,6 @@ class RecurrentActor(nn.Module):
     action_head: nn.Module
     hidden_state_dim: int = 128
     temporal_core: str = "gru"
-    attn_token_dim: int = 128
-    attn_window: int = 64
-    attn_heads: int = 4
     aux_predict: bool = False
 
     @nn.compact
@@ -196,19 +193,7 @@ class RecurrentActor(nn.Module):
             action_mask = observation.action_mask
 
         policy_rnn_input = (policy_embedding, done)
-        if self.temporal_core == "window_attention":
-            policy_hidden_state, policy_embedding = ScannedWindowAttention(
-                hidden_state_dim=self.hidden_state_dim,
-                token_dim=self.attn_token_dim,
-                window=self.attn_window,
-                n_heads=self.attn_heads,
-            )(policy_hidden_state, policy_rnn_input)
-        elif self.temporal_core == "ssm":
-            # Fork §53: diagonal gated selective SSM (Mamba-lineage).
-            policy_hidden_state, policy_embedding = ScannedSSM(
-                hidden_state_dim=self.hidden_state_dim
-            )(policy_hidden_state, policy_rnn_input)
-        elif self.temporal_core == "dual_gru":
+        if self.temporal_core == "dual_gru":
             # Fork §80: phase-gated dual-timescale GRU (see ScannedDualGRU).
             policy_hidden_state, policy_embedding = ScannedDualGRU(
                 hidden_state_dim=self.hidden_state_dim
@@ -387,120 +372,6 @@ class QMixingNetwork(nn.Module):
         return q_tot
 
 
-class ScannedWindowAttention(nn.Module):
-    """Sliding-window temporal attention cell — a GRU-replacement (fork §51).
-
-    Same outer interface as ``ScannedRNN`` (scan over (embedding, done);
-    carry created by zeros of ``hidden_state_dim``): the carry is a FLAT
-    ``(B, N, window * (token_dim + 1))`` array packing a KV cache of the
-    last ``window`` input tokens plus a per-slot validity mask, so
-    ``ScannedRNN.initialize_carry`` (zeros == empty memory) works unchanged
-    at every call site. Each step: project the input to ``token_dim``,
-    attend (with learned slot-position embeddings, newest slot last) over
-    the valid cached tokens + the current token, residual + LayerNorm +
-    FFN, emit; then roll the cache. ``done`` zeroes the cache (episode
-    reset), matching GRU reset semantics. Causality is inherent to the
-    scan. ``hidden_state_dim`` MUST equal ``window * (token_dim + 1)`` —
-    asserted at call time.
-    """
-
-    hidden_state_dim: int = 8256
-    token_dim: int = 128
-    window: int = 64
-    n_heads: int = 4
-
-    @functools.partial(
-        nn.scan,
-        variable_broadcast="params",
-        in_axes=0,
-        out_axes=0,
-        split_rngs={"params": False},
-    )
-    # Fork §53: scan-over-remat. Without it, BPTT stores every step's
-    # attention internals — a single ~10GB residual buffer at 128 envs
-    # (observed OOM). Remat recomputes the cell in the backward pass from
-    # (carry, input) instead; memory drops ~T-fold for ~30% extra compute.
-    @nn.remat
-    @nn.compact
-    def __call__(self, carry: chex.Array, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
-        ins, resets = x
-        M, d = self.window, self.token_dim
-        assert self.hidden_state_dim == M * (d + 1), (
-            f"hidden_state_dim must be window*(token_dim+1) = {M * (d + 1)}, "
-            f"got {self.hidden_state_dim}"
-        )
-        carry = jnp.where(resets[:, :, jnp.newaxis], jnp.zeros_like(carry), carry)
-        lead = carry.shape[:-1]  # (B, N)
-        buffer = carry[..., : M * d].reshape(*lead, M, d)
-        valid = carry[..., M * d :]  # (B, N, M)
-
-        tok = nn.Dense(d)(ins)  # (B, N, d)
-        pos = self.param(
-            "pos_emb", nn.initializers.normal(0.02), (M + 1, d)
-        )
-        kv = jnp.concatenate([buffer, tok[..., None, :]], axis=-2) + pos
-        kv_valid = jnp.concatenate(
-            [valid, jnp.ones((*lead, 1), valid.dtype)], axis=-1
-        )  # (B, N, M+1)
-        attn_mask = kv_valid[..., None, None, :] > 0.5  # (B, N, 1, 1, M+1)
-        attended = nn.MultiHeadDotProductAttention(
-            num_heads=self.n_heads, qkv_features=d
-        )(tok[..., None, :], kv, mask=attn_mask)[..., 0, :]
-        y = nn.LayerNorm()(tok + attended)
-        y = nn.LayerNorm()(y + nn.Dense(d)(nn.relu(nn.Dense(2 * d)(y))))
-
-        new_buffer = jnp.concatenate([buffer[..., 1:, :], tok[..., None, :]], axis=-2)
-        new_valid = jnp.concatenate(
-            [valid[..., 1:], jnp.ones((*lead, 1), valid.dtype)], axis=-1
-        )
-        new_carry = jnp.concatenate(
-            [new_buffer.reshape(*lead, M * d), new_valid], axis=-1
-        )
-        return new_carry, y
-
-
-class ScannedSSM(nn.Module):
-    """Diagonal gated selective SSM cell — a GRU replacement (fork §53).
-
-    Mamba-lineage recurrence in ``ScannedRNN``'s exact interface: the carry
-    is the flat ``(B, N, hidden_state_dim)`` diagonal state (zeros == empty
-    memory, so every ``initialize_carry`` site works unchanged) and ``done``
-    zeroes it. Per step, input-dependent (selective) step sizes modulate a
-    learned stable per-channel decay:
-
-        dt = softplus(W_dt x)                    input-dependent step size
-        a  = exp(-softplus(A_log) * dt)          decay in (0, 1)
-        h' = a * h + (1 - a) * (W_in x)          ZOH-style state update
-        y  = LayerNorm(h' * silu(W_gate x))      gated readout
-
-    Output width == ``hidden_state_dim`` (the GRU convention), so post-torsos
-    and all hstate plumbing are untouched. Per-step internals are O(S) — no
-    remat needed (nothing like the attention cell's window buffers).
-    """
-
-    hidden_state_dim: int = 128
-
-    @functools.partial(
-        nn.scan,
-        variable_broadcast="params",
-        in_axes=0,
-        out_axes=0,
-        split_rngs={"params": False},
-    )
-    @nn.compact
-    def __call__(self, carry: chex.Array, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
-        ins, resets = x
-        carry = jnp.where(resets[:, :, jnp.newaxis], jnp.zeros_like(carry), carry)
-        s = self.hidden_state_dim
-        assert carry.shape[-1] == s, (
-            f"ScannedSSM carry width {carry.shape[-1]} != hidden_state_dim {s}"
-        )
-        dt = jax.nn.softplus(nn.Dense(s, name="dt_proj")(ins))
-        a_log = self.param("A_log", nn.initializers.normal(0.5), (s,))
-        a = jnp.exp(-jax.nn.softplus(a_log) * dt)
-        h = a * carry + (1.0 - a) * nn.Dense(s, name="in_proj")(ins)
-        y = nn.LayerNorm()(h * jax.nn.silu(nn.Dense(s, name="gate_proj")(ins)))
-        return h, y
 
 
 class ScannedDualGRU(nn.Module):

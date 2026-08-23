@@ -543,20 +543,13 @@ def learner_setup(
         hidden_state_dim=config.network.hidden_state_dim,
         # Fork §51: optional temporal-core swap (default "gru" = stock).
         temporal_core=config.network.get("temporal_core", "gru"),
-        attn_token_dim=config.network.get("attn_token_dim", 128),
-        attn_window=config.network.get("attn_window", 64),
-        attn_heads=config.network.get("attn_heads", 4),
         # Fork §53: aux evader-prediction head, on iff the loss uses it.
         aux_predict=bool(config.system.get("aux_predict_coef", 0.0)),
     )
     critic_network = Critic(
         pre_torso=critic_pre_torso,
         post_torso=critic_post_torso,
-        # Fork §51: the critic keeps its own (GRU) hidden dim when the actor
-        # uses the window-attention core's flat-carry width.
-        hidden_state_dim=config.network.get(
-            "critic_hidden_state_dim", config.network.hidden_state_dim
-        ),
+        hidden_state_dim=config.network.hidden_state_dim,
         centralised_critic=True,
     )
 
@@ -587,8 +580,7 @@ def learner_setup(
         (config.arch.num_envs, num_agents), config.network.hidden_state_dim
     )
     init_critic_hstate = ScannedRNN.initialize_carry(
-        (config.arch.num_envs, num_agents),
-        config.network.get("critic_hidden_state_dim", config.network.hidden_state_dim),
+        (config.arch.num_envs, num_agents), config.network.hidden_state_dim
     )
 
     # initialise params and optimiser state.
