@@ -220,7 +220,11 @@ class RecurrentValueNet(nn.Module):
     post_torso: nn.Module
     centralised_critic: bool = False
     hidden_state_dim: int = 128
-    # Fork §107 (DESIGN §86b(a) / §105 Arm E): phase-SEPARATED value heads.
+    # Fork §110 (DESIGN §86b(a) / §105 Arm E): phase-SEPARATED value heads.
+    # The gate is the pursuit env's hidden-phase flag, which DESIGN §111 made
+    # UNCONDITIONAL (the last global_state element is always that flag), so no
+    # precondition check is needed — the earlier validator became vacuous and
+    # was removed with the flag it guarded.
     # False = stock single head. True = two heads, selected per timestep by
     # the env's hidden-phase flag, which the pursuit env appends as the LAST
     # element of ``global_state`` under ``hidden_until_seen`` (1.0 = evader

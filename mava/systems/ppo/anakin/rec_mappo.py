@@ -551,8 +551,8 @@ def learner_setup(
         post_torso=critic_post_torso,
         hidden_state_dim=config.network.hidden_state_dim,
         centralised_critic=True,
-        # Fork §107 (Arm E): phase-separated value heads gated on the env's
-        # hidden-phase flag. Requires env.kwargs.hidden_until_seen=True.
+        # Fork §110 (Arm E): phase-separated value heads gated on the env's
+        # hidden-phase flag, which §111 made unconditional.
         phase_critic=bool(config.network.get("phase_critic", False)),
     )
 
