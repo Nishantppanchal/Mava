@@ -220,6 +220,25 @@ class RecurrentValueNet(nn.Module):
     post_torso: nn.Module
     centralised_critic: bool = False
     hidden_state_dim: int = 128
+    # Fork §107 (DESIGN §86b(a) / §105 Arm E): phase-SEPARATED value heads.
+    # False = stock single head. True = two heads, selected per timestep by
+    # the env's hidden-phase flag, which the pursuit env appends as the LAST
+    # element of ``global_state`` under ``hidden_until_seen`` (1.0 = evader
+    # still hidden => SEARCH, 0.0 => CHASE).
+    #
+    # Why: §86 / §86b measured that scaling the search reward 1x / 5x / 20x
+    # buys nothing, nothing, and a transient that decays back to the control
+    # plateau — "the plateau is a fixed point of the SHARED value/advantage
+    # stream, not a reward-magnitude artifact". One scalar V must explain
+    # both a diffuse 500-step search and a sharp 100-step interception, so
+    # search TD error is dominated by chase variance. ``jnp.where`` routes
+    # the gradient to exactly one head per timestep, so the two phases stop
+    # competing for the same output while the POLICY stays single (the
+    # advantage each head produces feeds the same actor loss).
+    #
+    # Requires the flag to exist: pursuit env with ``hidden_until_seen=True``.
+    # Changes the param tree => NO warm-start across the swap.
+    phase_critic: bool = False
 
     @nn.compact
     def __call__(
@@ -230,6 +249,7 @@ class RecurrentValueNet(nn.Module):
         """Forward pass."""
         observation, done = observation_done
 
+        phase_search = None
         if is_graph_observation(observation):
             validate_graph_components(self.pre_torso, observation)
             value_embedding = self.pre_torso(observation)
@@ -243,14 +263,26 @@ class RecurrentValueNet(nn.Module):
                 # Get single agent view in the case of a decentralised critic.
                 observation = observation.agents_view
 
+            if self.phase_critic:
+                # Read the gate BEFORE the torso: last feature of the critic
+                # vector. Kept as (..., 1) so it broadcasts against the heads.
+                phase_search = observation[..., -1:]
+
             value_embedding = self.pre_torso(observation)
 
         value_rnn_input = (value_embedding, done)
         value_net_hidden_state, value_embedding = ScannedRNN(self.hidden_state_dim)(
             value_net_hidden_state, value_rnn_input
         )
-        value = self.post_torso(value_embedding)
-        value = nn.Dense(1, kernel_init=orthogonal(1.0))(value)
+        value_embedding = self.post_torso(value_embedding)
+        if phase_search is None:
+            value = nn.Dense(1, kernel_init=orthogonal(1.0))(value_embedding)
+        else:
+            # Two heads over the SAME recurrent trunk: the shared trunk keeps
+            # one state estimate, only the value readout is phase-specific.
+            value_search = nn.Dense(1, kernel_init=orthogonal(1.0))(value_embedding)
+            value_chase = nn.Dense(1, kernel_init=orthogonal(1.0))(value_embedding)
+            value = jnp.where(phase_search > 0.5, value_search, value_chase)
 
         return value_net_hidden_state, jnp.squeeze(value, axis=-1)
 
