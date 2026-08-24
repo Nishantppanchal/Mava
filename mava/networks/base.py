@@ -227,7 +227,7 @@ class RecurrentValueNet(nn.Module):
     # was removed with the flag it guarded.
     # False = stock single head. True = two heads, selected per timestep by
     # the env's hidden-phase flag, which the pursuit env appends as the LAST
-    # element of ``global_state`` under ``hidden_until_seen`` (1.0 = evader
+    # element of ``global_state`` (1.0 = evader
     # still hidden => SEARCH, 0.0 => CHASE).
     #
     # Why: §86 / §86b measured that scaling the search reward 1x / 5x / 20x
@@ -240,7 +240,7 @@ class RecurrentValueNet(nn.Module):
     # competing for the same output while the POLICY stays single (the
     # advantage each head produces feeds the same actor loss).
     #
-    # Requires the flag to exist: pursuit env with ``hidden_until_seen=True``.
+    # The pursuit env always provides that flag (DESIGN §111).
     # Changes the param tree => NO warm-start across the swap.
     phase_critic: bool = False
 
