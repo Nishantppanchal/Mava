@@ -339,8 +339,26 @@ def get_learner_fn(
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
                         value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
 
+                    # §117 (D2) instrumentation. Two statistics that decide
+                    # whether the Huber/clipping regime is actually costing us,
+                    # and that a checkpoint replay CANNOT produce — clipping
+                    # compares the freshly-updated value against the stored old
+                    # value and GAE target DURING the PPO epochs, while a replay
+                    # only ever sees final parameters.
+                    #   huber_frac: fraction of residuals in Huber's LINEAR
+                    #     region (|V-target| > delta), where gradients are
+                    #     bounded and the objective stops being mean-seeking.
+                    #     Terminal return RANGE does not establish this — it has
+                    #     to be measured on the actual GAE targets.
+                    #   clip_frac: fraction of samples whose loss comes from the
+                    #     CLIPPED branch, i.e. where a large corrective step is
+                    #     being suppressed.
+                    resid = jnp.abs(value - targets)
+                    huber_frac = (resid > config.system.get("huber_delta", 1.0)).mean()
+                    clip_frac = (value_losses_clipped > value_losses).mean()
+
                     total_loss = config.system.vf_coef * value_loss
-                    return total_loss, value_loss
+                    return total_loss, (value_loss, huber_frac, clip_frac)
 
                 # Calculate actor loss
                 key, entropy_key = jax.random.split(key)
@@ -391,7 +409,9 @@ def get_learner_fn(
                 new_opt_state = OptStates(actor_new_opt_state, critic_new_opt_state)
 
                 actor_loss, (_, entropy, aux_mse) = actor_loss_info
-                value_loss, unscaled_value_loss = value_loss_info
+                value_loss, (unscaled_value_loss, huber_frac, clip_frac) = (
+                    value_loss_info
+                )
 
                 total_loss = actor_loss + value_loss
                 loss_info = {
@@ -401,6 +421,13 @@ def get_learner_fn(
                     "entropy": entropy,
                     # Fork §53: 0.0 unless system.aux_predict_coef is set.
                     "aux_predict_loss": aux_mse,
+                    # Fork §117 (D2): the value-target regime. huber_frac is the
+                    # fraction of residuals in Huber's linear region (bounded
+                    # gradients, median-seeking); clip_frac is the fraction
+                    # taking the CLIPPED branch (a large correction suppressed).
+                    # Both are training-time only — a replay cannot see them.
+                    "huber_frac": huber_frac,
+                    "clip_frac": clip_frac,
                 }
 
                 return (new_params, new_opt_state, entropy_key), loss_info
