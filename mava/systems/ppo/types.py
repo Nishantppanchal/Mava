@@ -17,6 +17,8 @@ import chex
 from flax.core.frozen_dict import FrozenDict
 from jumanji.types import TimeStep
 from optax._src.base import OptState
+from typing import Optional
+
 from typing_extensions import NamedTuple
 
 from mava.types import Action, Done, HiddenState, Observation, State, Value
@@ -97,3 +99,12 @@ class RNNPPOTransition(NamedTuple):
     log_prob: chex.Array
     obs: chex.Array
     hstates: HiddenStates
+    # Fork (trust-aware-drone-pursuit-evasion §131d): per-agent mask marking
+    # whose transitions the POLICY loss may train on. The env supplies it as
+    # ``extras["learn_mask"]`` when a compromised agent is present: that agent
+    # runs the shared policy on a deliberately falsified input, so training on
+    # its rows teaches the policy how to behave while believing a phantom.
+    # ``None`` (the default, and every run that does not set the env flag)
+    # means "train on everything" and is an exact no-op — None is an empty
+    # pytree node, so the trajectory structure is unchanged.
+    learn_mask: Optional[chex.Array] = None

@@ -189,6 +189,9 @@ def get_learner_fn(
                 log_prob,
                 last_timestep.observation,
                 last_hstates,
+                # Fork §131d: absent unless the env opts in, in which case the
+                # field stays None and everything below is an exact no-op.
+                last_timestep.extras.get("learn_mask"),
             )
             learner_state = RNNLearnerState(
                 params, opt_states, key, env_state, timestep, done, hstates
@@ -274,9 +277,24 @@ def get_learner_fn(
                         * gae
                     )
                     actor_loss = -jnp.minimum(actor_loss1, actor_loss2)
-                    actor_loss = actor_loss.mean()
-                    # The seed will be used in the TanhTransformedDistribution:
-                    entropy = actor_policy.entropy(seed=key).mean()
+                    ent_per_agent = actor_policy.entropy(seed=key)
+                    # Fork §131d: exclude a COMPROMISED agent's transitions from
+                    # the policy objective. It runs the shared policy on a
+                    # deliberately falsified input, so its rows teach the policy
+                    # how to act while believing a phantom — and let it discover
+                    # poses that make its own lie easy to detect, a harness
+                    # artefact no strategic attacker would reproduce. The critic
+                    # is NOT masked: the value function must still learn what a
+                    # state with a compromised teammate in it is worth.
+                    lm = traj_batch.learn_mask
+                    if lm is None:
+                        actor_loss = actor_loss.mean()
+                        entropy = ent_per_agent.mean()
+                    else:
+                        w = lm.astype(actor_loss.dtype)
+                        denom = jnp.sum(w) + 1e-8
+                        actor_loss = jnp.sum(actor_loss * w) / denom
+                        entropy = jnp.sum(ent_per_agent * w) / denom
 
                     ent_coef = _adaptive_ent_coef(
                         config.system.ent_coef,
