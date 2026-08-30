@@ -257,7 +257,22 @@ def get_learner_fn(
                             obs_and_done,
                             mutable=["intermediates"],
                         )
-                        aux_pred = inters["intermediates"]["aux_evader_pred"][0]
+                        # Fork §134: under GatedResidualActor the champion is
+                        # a SUBMODULE, so flax nests its sow one level down
+                        # ({"champion": {"aux_evader_pred": ...}}) and a
+                        # top-level lookup raises KeyError. Find it wherever
+                        # it is rather than hard-coding either shape.
+                        def _find_sow(d):
+                            if "aux_evader_pred" in d:
+                                return d["aux_evader_pred"][0]
+                            for v in d.values():
+                                if isinstance(v, dict):
+                                    found = _find_sow(v)
+                                    if found is not None:
+                                        return found
+                            return None
+
+                        aux_pred = _find_sow(inters["intermediates"])
                     else:
                         _, actor_policy = actor_apply_fn(
                             actor_params, traj_batch.hstates.policy_hidden_state[0], obs_and_done
@@ -642,12 +657,18 @@ def learner_setup(
         def _label(path, _leaf):
             return "freeze" if any("champion" in str(k) for k in path) else "train"
 
+        # Zero the champion's gradients FIRST, then clip. The other order
+        # would let the frozen half contribute to the global norm — and it
+        # does contribute: the §53 aux head lives inside the champion and
+        # produces a real gradient — which would silently shrink the
+        # residual's effective step by a factor nobody chose.
         actor_optim = optax.chain(
-            optax.clip_by_global_norm(config.system.max_grad_norm),
             optax.multi_transform(
-                {"train": optax.adam(actor_lr, eps=1e-5), "freeze": optax.set_to_zero()},
+                {"train": optax.identity(), "freeze": optax.set_to_zero()},
                 lambda params: flax.traverse_util.path_aware_map(_label, params),
             ),
+            optax.clip_by_global_norm(config.system.max_grad_norm),
+            optax.adam(actor_lr, eps=1e-5),
         )
     critic_optim = optax.chain(
         optax.clip_by_global_norm(config.system.max_grad_norm),
