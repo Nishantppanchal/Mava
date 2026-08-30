@@ -22,7 +22,7 @@ import tensorflow_probability.substrates.jax.distributions as tfd
 from flax import linen as nn
 from flax.linen.initializers import orthogonal
 
-from mava.networks.distributions import MaskedEpsGreedyDistribution
+from mava.networks.distributions import IdentityTransformation, MaskedEpsGreedyDistribution
 from mava.networks.torsos import MLPTorso
 from mava.types import (
     GraphObservation,
@@ -211,6 +211,78 @@ class RecurrentActor(nn.Module):
         pi = self.action_head(policy_embedding, action_mask)
 
         return policy_hidden_state, pi
+
+
+class GatedResidualActor(nn.Module):
+    """Fork §134: a frozen champion plus a residual that only acts under alarm.
+
+        logits = champion(head_slice) + alarm * residual(tail_slice)
+
+    The point is a GUARANTEE, not a regulariser. `alarm` is a hard 0/1 column
+    the environment sets when an agent distrusts some live teammate, so on a
+    team with no liars it is exactly 0, the product is exactly 0, and IEEE
+    addition of 0.0 leaves the champion's logits bit-identical. A policy
+    fine-tuned this way therefore cannot regress on an honest team — not
+    "measurably does not", cannot — while remaining free to learn a different
+    response once the symbolic filter has flagged something.
+
+    That is the neurosymbolic split the Neuro-AGR framing asks for, made
+    load-bearing: the symbolic filter decides WHEN the learned part is allowed
+    to intervene, and the learned part decides WHAT to do about it.
+
+    The champion sees `agents_view` with the trust tail cut out, which is
+    bit-identical to the view it was trained on, so a pre-trust checkpoint
+    grafts in unchanged. The recurrent carry is the champion's, so every
+    evaluator, renderer and probe works untouched.
+    """
+
+    champion: nn.Module  # a RecurrentActor, frozen
+    residual_torso: nn.Module
+    action_dim: int
+    tail_start: int
+    tail_width: int
+    hidden_state_dim: int = 128
+    freeze_champion: bool = True
+
+    @nn.compact
+    def __call__(
+        self,
+        policy_hidden_state: chex.Array,
+        observation_done: RNNObservation,
+    ) -> Tuple[chex.Array, tfd.Distribution]:
+        observation, done = observation_done
+        view = observation.agents_view
+        lo, hi = self.tail_start, self.tail_start + self.tail_width
+        head = jnp.concatenate([view[..., :lo], view[..., hi:]], axis=-1)
+        tail = view[..., lo:hi]
+
+        policy_hidden_state, pi = self.champion(
+            policy_hidden_state, (observation._replace(agents_view=head), done)
+        )
+        logits = pi.distribution.logits
+        if self.freeze_champion:
+            logits = jax.lax.stop_gradient(logits)
+
+        # Zero-init: the residual starts as an exact no-op, so the first PPO
+        # ratio is 1 even on the steps where the alarm IS firing. A randomly
+        # initialised head would move the policy before it had learned
+        # anything, which is the usual way a "safe" fine-tune destroys a
+        # champion in its first update.
+        r = nn.Dense(
+            self.action_dim,
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.zeros,
+            name="residual_head",
+        )(self.residual_torso(tail))
+        alarm = tail[..., -1:]  # the env writes this LAST in the tail block
+        merged = jnp.where(
+            observation.action_mask,
+            logits + alarm * r,
+            jnp.finfo(jnp.float32).min,
+        )
+        return policy_hidden_state, IdentityTransformation(
+            distribution=tfd.Categorical(logits=merged)
+        )
 
 
 class RecurrentValueNet(nn.Module):

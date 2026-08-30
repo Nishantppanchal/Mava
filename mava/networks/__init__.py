@@ -18,6 +18,7 @@ from mava.networks.base import (
     FeedForwardQNet,
     FeedForwardValueNet,
     RecQNetwork,
+    GatedResidualActor,
     RecurrentActor,
     RecurrentValueNet,
     ScannedRNN,

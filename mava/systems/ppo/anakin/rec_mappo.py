@@ -22,12 +22,13 @@ import jax
 import jax.numpy as jnp
 import optax
 from colorama import Fore, Style
+import flax
 from flax.core.frozen_dict import FrozenDict
 from jax import tree
 from omegaconf import DictConfig, OmegaConf
 
 from mava.evaluator import get_eval_fn, get_num_eval_envs, make_rec_eval_act_fn
-from mava.networks import RecurrentActor as Actor
+from mava.networks import GatedResidualActor, RecurrentActor as Actor
 from mava.networks import RecurrentValueNet as Critic
 from mava.networks import ScannedRNN
 from mava.systems.ppo.types import (
@@ -591,6 +592,31 @@ def learner_setup(
         # Fork §53: aux evader-prediction head, on iff the loss uses it.
         aux_predict=bool(config.system.get("aux_predict_coef", 0.0)),
     )
+    # Fork §134 Layer 3: wrap the champion in a gated residual. The residual
+    # is the only trainable part and it is multiplied by a hard 0/1 alarm the
+    # environment sets, so on a team with no liars it contributes exactly zero
+    # and the fine-tuned policy is bit-identical to the checkpoint it started
+    # from. See GatedResidualActor.
+    residual_cfg = config.network.get("residual", None)
+    if residual_cfg is not None and residual_cfg.get("enabled", False):
+        tail_start, tail_width = env.unwrapped.actor_tail_slice
+        if tail_width <= 0:
+            raise ValueError(
+                "network.residual.enabled needs the env's trust tail: set "
+                "env.kwargs.trust_tail=True (with trust_obs and belief_obs)"
+            )
+        config.system.tail_start = int(tail_start)
+        config.system.tail_width = int(tail_width)
+        actor_network = GatedResidualActor(
+            champion=actor_network,
+            residual_torso=hydra.utils.instantiate(residual_cfg.torso),
+            action_dim=env.action_dim,
+            tail_start=int(tail_start),
+            tail_width=int(tail_width),
+            hidden_state_dim=config.network.hidden_state_dim,
+            freeze_champion=bool(residual_cfg.get("freeze_champion", True)),
+        )
+
     critic_network = Critic(
         pre_torso=critic_pre_torso,
         post_torso=critic_post_torso,
@@ -605,6 +631,24 @@ def learner_setup(
         optax.clip_by_global_norm(config.system.max_grad_norm),
         optax.adam(actor_lr, eps=1e-5),
     )
+    if residual_cfg is not None and residual_cfg.get("enabled", False) and residual_cfg.get(
+        "freeze_champion", True
+    ):
+        # Belt and braces. stop_gradient already zeroes the champion's
+        # gradients, but a zero gradient still moves an Adam state, and a
+        # future edit that removed the stop_gradient would silently start
+        # training the champion. Partitioning says the intent in one place the
+        # test can assert on.
+        def _label(path, _leaf):
+            return "freeze" if any("champion" in str(k) for k in path) else "train"
+
+        actor_optim = optax.chain(
+            optax.clip_by_global_norm(config.system.max_grad_norm),
+            optax.multi_transform(
+                {"train": optax.adam(actor_lr, eps=1e-5), "freeze": optax.set_to_zero()},
+                lambda params: flax.traverse_util.path_aware_map(_label, params),
+            ),
+        )
     critic_optim = optax.chain(
         optax.clip_by_global_norm(config.system.max_grad_norm),
         optax.adam(critic_lr, eps=1e-5),
@@ -669,6 +713,19 @@ def learner_setup(
         # differ (e.g. warm-starting a 128-env checkpoint at 256 envs), keep
         # the freshly initialised hstates instead — they are transient
         # per-episode context, not learned state.
+        # Fork §134: a champion checkpoint has no "champion" subtree, so graft
+        # it into one. This is what lets the residual arm warm-start from the
+        # existing T2 ladder instead of needing a fresh one.
+        if (
+            residual_cfg is not None
+            and residual_cfg.get("enabled", False)
+            and "champion" not in restored_params.actor_params["params"]
+        ):
+            grafted = flax.core.unfreeze(actor_params)
+            grafted["params"]["champion"] = flax.core.unfreeze(
+                restored_params.actor_params
+            )["params"]
+            restored_params = restored_params._replace(actor_params=grafted)
         params = restored_params
         if restored_hstates is not None:
             fresh_shapes = jax.tree_util.tree_map(lambda x: x.shape, hstates)
