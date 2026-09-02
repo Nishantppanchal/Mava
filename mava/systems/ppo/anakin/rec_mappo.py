@@ -83,6 +83,45 @@ def _adaptive_ent_coef(base: float, entropy: chex.Array, target: Any, gain: floa
     return jnp.where(h < target, boost, penalty)
 
 
+def _masked_normalise(x: chex.Array, w: Any = None) -> chex.Array:
+    """Fork §131d: standardise ``x`` using only the rows ``w`` selects.
+
+    PPO normalises the advantage at minibatch level, and with ``learn_mask``
+    on that scaling was computed over EVERY row and only then were the masked
+    rows dropped from the mean. A compromised agent's transitions therefore
+    still set the location and scale that every honest agent's gradient was
+    divided by — the same leak the mask exists to close, one step upstream of
+    where it was closed. A liar acting on a falsified observation is exactly
+    the agent whose advantages sit in the tail, so this is not a rounding
+    difference: it is an attacker-controlled gain on the honest update.
+
+    ``w=None`` takes the unmasked path and is BIT-IDENTICAL to the previous
+    expression (same op order, same 1e-8), so every no-mask run — i.e. every
+    run in the campaign record — is unaffected.
+
+    The masked branch uses the weighted mean and the weighted second moment
+    about it, guarded so an all-zero mask yields zeros rather than NaNs (a
+    minibatch in which no agent is learnable contributes nothing anyway, and
+    a NaN there would poison the whole update).
+
+    The masked entries are ZEROED before the reductions rather than merely
+    weighted by zero: ``NaN * 0`` is ``NaN``, so a single non-finite advantage
+    on a row the mask drops would otherwise flow through the sum into the mean
+    and the variance and back out onto every row the mask KEEPS — the masked
+    rows leaking into the honest update again, by a different route. ``x``
+    itself is still the numerator, so a non-finite value on a KEPT row is left
+    visible instead of being silently zeroed.
+    """
+    if w is None:
+        return (x - x.mean()) / (x.std() + 1e-8)
+    w = w.astype(x.dtype)
+    denom = jnp.sum(w) + 1e-8
+    safe_x = jnp.where(w > 0, x, jnp.zeros_like(x))
+    mean = jnp.sum(safe_x * w) / denom
+    var = jnp.sum(w * jnp.square(safe_x - mean)) / denom
+    return jnp.where(w > 0, (x - mean) / (jnp.sqrt(var) + 1e-8), 0.0)
+
+
 def get_learner_fn(
     env: MarlEnv,
     apply_fns: Tuple[RecActorApply, RecCriticApply],
@@ -281,8 +320,11 @@ def get_learner_fn(
 
                     # Calculate actor loss
                     ratio = jnp.exp(log_prob - traj_batch.log_prob)
-                    # Nomalise advantage at minibatch level
-                    gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                    # Nomalise advantage at minibatch level — over the rows the
+                    # mask keeps, not over all of them (fork §131d; see
+                    # ``_masked_normalise`` for why the difference matters).
+                    lm = traj_batch.learn_mask
+                    gae = _masked_normalise(gae, lm)
                     actor_loss1 = ratio * gae
                     actor_loss2 = (
                         jnp.clip(
@@ -302,7 +344,7 @@ def get_learner_fn(
                     # artefact no strategic attacker would reproduce. The critic
                     # is NOT masked: the value function must still learn what a
                     # state with a compromised teammate in it is worth.
-                    lm = traj_batch.learn_mask
+                    # (``lm`` was read above, where the advantage is scaled.)
                     if lm is None:
                         actor_loss = actor_loss.mean()
                         entropy = ent_per_agent.mean()
