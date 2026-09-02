@@ -166,6 +166,14 @@ class RecurrentActor(nn.Module):
     ``mutable=["intermediates"]`` and trains it supervised on the true
     future evader position (dense hindsight signal shaping the shared
     representation toward route prediction).
+
+    Fork §138/WP3: ``return_core`` makes ``__call__`` return a THIRD element,
+    the post-GRU core embedding (the same tensor the §53 aux head reads, before
+    ``post_torso``). It exists for ``GatedResidualActor``, whose residual has
+    to condition on what the champion's recurrent state already knows — a sow
+    cannot be read back inside the same forward pass, and re-running the
+    champion would double the cost. Params are untouched by the flag, so a
+    checkpoint grafts in either way.
     """
 
     pre_torso: nn.Module
@@ -174,6 +182,7 @@ class RecurrentActor(nn.Module):
     hidden_state_dim: int = 128
     temporal_core: str = "gru"
     aux_predict: bool = False
+    return_core: bool = False
 
     @nn.compact
     def __call__(
@@ -207,33 +216,55 @@ class RecurrentActor(nn.Module):
             # gradient shapes the recurrent representation itself.
             aux = nn.Dense(2, name="aux_evader_head")(policy_embedding)
             self.sow("intermediates", "aux_evader_pred", aux)
+        core_embedding = policy_embedding
         policy_embedding = self.post_torso(policy_embedding)
         pi = self.action_head(policy_embedding, action_mask)
 
+        if self.return_core:
+            return policy_hidden_state, pi, core_embedding
         return policy_hidden_state, pi
 
 
 class GatedResidualActor(nn.Module):
-    """Fork §134: a frozen champion plus a residual that only acts under alarm.
+    """Fork §134/§138: a frozen champion plus a gated residual.
 
-        logits = champion(head_slice) + alarm * residual(tail_slice)
+        merged = champion(head) + g * clip(delta, -delta_clip, +delta_clip)
 
-    The point is a GUARANTEE, not a regulariser. `alarm` is a hard 0/1 column
-    the environment sets when an agent distrusts some live teammate, so on a
-    team with no liars it is exactly 0, the product is exactly 0, and IEEE
-    addition of 0.0 leaves the champion's logits bit-identical. A policy
-    fine-tuned this way therefore cannot regress on an honest team — not
-    "measurably does not", cannot — while remaining free to learn a different
-    response once the symbolic filter has flagged something.
+    ``gate="hard"`` is §134f, unchanged and still the default: ``g`` is the
+    environment's hard 0/1 alarm column, so on a team with no liars it is
+    exactly 0, the product is exactly 0, and IEEE addition of 0.0 leaves the
+    champion's logits bit-identical. That was a GUARANTEE, and §138 records
+    why it was too strong to keep as the only option: an alarm-gated residual
+    can only act after the symbolic filter has already convicted someone, so
+    its ceiling is the damage that survives detection -- measured at +0.0020
+    [-0.0042, +0.0079], i.e. nothing.
 
-    That is the neurosymbolic split the Neuro-AGR framing asks for, made
-    load-bearing: the symbolic filter decides WHEN the learned part is allowed
-    to intervene, and the learned part decides WHAT to do about it.
+    ``gate="soft"`` replaces the guarantee with a BUDGET. ``g`` is a learned
+    sigmoid, biased at ``gate_bias0`` (default -4.0, ~2 % open) so the policy
+    starts almost closed, and ``delta`` comes from a zero-initialised head, so
+    at init ``merged`` equals the champion EXACTLY regardless of ``g`` and the
+    first PPO ratio is 1. What keeps the honest cost small afterwards is not
+    the architecture but ``system.honest_kl_coef``, a KL penalty against the
+    champion on honest-episode steps, plus ``delta_clip`` on the logit
+    displacement. "Cannot regress" becomes "regresses by at most epsilon,
+    measured" -- §138's decision, taken with the user.
 
-    The champion sees `agents_view` with the trust tail cut out, which is
-    bit-identical to the view it was trained on, so a pre-trust checkpoint
+    ``full_view`` (§138/WP3) decides what the residual READS. The §134f
+    residual saw only the tail window, which is enough to notice a liar and
+    nothing like enough to do anything about one: a policy that cannot see its
+    own pose, the local map or the per-source reports cannot choose a
+    verification detour or a search pattern. With ``full_view`` it reads the
+    whole ``agents_view`` (head AND tail) concatenated with the champion's
+    post-GRU core embedding (stop-gradiented, so the frozen half stays frozen
+    and the residual inherits the champion's memory for free).
+
+    The champion always sees ``agents_view`` with the trust tail cut out, which
+    is bit-identical to the view it was trained on, so a pre-trust checkpoint
     grafts in unchanged. The recurrent carry is the champion's, so every
     evaluator, renderer and probe works untouched.
+
+    Sows ``gate`` and ``champion_logits`` into "intermediates" for the loss
+    (the honest-episode KL needs the reference logits) and for logging.
     """
 
     champion: nn.Module  # a RecurrentActor, frozen
@@ -243,6 +274,10 @@ class GatedResidualActor(nn.Module):
     tail_width: int
     hidden_state_dim: int = 128
     freeze_champion: bool = True
+    gate: str = "hard"
+    gate_bias0: float = -4.0
+    delta_clip: float = 5.0
+    full_view: bool = False
 
     @nn.compact
     def __call__(
@@ -250,21 +285,44 @@ class GatedResidualActor(nn.Module):
         policy_hidden_state: chex.Array,
         observation_done: RNNObservation,
     ) -> Tuple[chex.Array, tfd.Distribution]:
+        if self.gate not in ("hard", "soft"):
+            raise ValueError(
+                f"residual.gate must be 'hard' or 'soft', got {self.gate!r}"
+            )
         observation, done = observation_done
         view = observation.agents_view
         lo, hi = self.tail_start, self.tail_start + self.tail_width
         head = jnp.concatenate([view[..., :lo], view[..., hi:]], axis=-1)
         tail = view[..., lo:hi]
 
-        policy_hidden_state, pi = self.champion(
+        champion_out = self.champion(
             policy_hidden_state, (observation._replace(agents_view=head), done)
         )
+        if len(champion_out) == 3:
+            policy_hidden_state, pi, core = champion_out
+        else:
+            policy_hidden_state, pi = champion_out
+            core = None
         logits = pi.distribution.logits
         if self.freeze_champion:
             logits = jax.lax.stop_gradient(logits)
 
+        if self.full_view:
+            if core is None:
+                raise ValueError(
+                    "residual.full_view needs the champion's core embedding: "
+                    "build the champion with RecurrentActor(return_core=True)"
+                )
+            # stop_gradient on BOTH halves of the frozen network's contribution.
+            # Without it the residual's loss would reach back through the GRU
+            # into the champion, and "frozen" would be true of the logits only.
+            residual_in = jnp.concatenate([view, jax.lax.stop_gradient(core)], axis=-1)
+        else:
+            residual_in = tail
+        residual_out = self.residual_torso(residual_in)
+
         # Zero-init: the residual starts as an exact no-op, so the first PPO
-        # ratio is 1 even on the steps where the alarm IS firing. A randomly
+        # ratio is 1 even on the steps where the gate IS open. A randomly
         # initialised head would move the policy before it had learned
         # anything, which is the usual way a "safe" fine-tune destroys a
         # champion in its first update.
@@ -273,13 +331,38 @@ class GatedResidualActor(nn.Module):
             kernel_init=nn.initializers.zeros,
             bias_init=nn.initializers.zeros,
             name="residual_head",
-        )(self.residual_torso(tail))
+        )(residual_out)
         alarm = tail[..., -1:]  # the env writes this LAST in the tail block
+        if self.gate == "hard":
+            g = alarm
+            delta = r
+        else:
+            # Zero kernel + constant bias: the gate is a pure function of the
+            # bias at init (~2 % open at -4.0) and cannot depend on the input
+            # until it has learned to, so the init identity holds for a reason
+            # independent of the head's zero-init.
+            g = nn.sigmoid(
+                nn.Dense(
+                    1,
+                    kernel_init=nn.initializers.zeros,
+                    bias_init=nn.initializers.constant(self.gate_bias0),
+                    name="residual_gate",
+                )(residual_out)
+            )
+            delta = jnp.clip(r, -self.delta_clip, self.delta_clip)
+        masked_champion = jnp.where(
+            observation.action_mask, logits, jnp.finfo(jnp.float32).min
+        )
         merged = jnp.where(
             observation.action_mask,
-            logits + alarm * r,
+            logits + g * delta,
             jnp.finfo(jnp.float32).min,
         )
+        # Read by _actor_loss_fn (the honest-episode KL) and by the loggers.
+        # Sowing is a no-op unless the caller passes mutable=["intermediates"],
+        # so this costs the rollout nothing.
+        self.sow("intermediates", "gate", g)
+        self.sow("intermediates", "champion_logits", masked_champion)
         return policy_hidden_state, IdentityTransformation(
             distribution=tfd.Categorical(logits=merged)
         )

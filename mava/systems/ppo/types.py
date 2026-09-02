@@ -108,3 +108,13 @@ class RNNPPOTransition(NamedTuple):
     # means "train on everything" and is an exact no-op — None is an empty
     # pytree node, so the trajectory structure is unchanged.
     learn_mask: Optional[chex.Array] = None
+    # Fork §138/WP3: per-agent flag marking a step of an episode with NO
+    # adversary on the team. It is a broadcast episode-level scalar, not a
+    # per-agent one — the honest-cost budget is about episodes the defence must
+    # not disturb, and on an attacked episode even the honest agents' behaviour
+    # is allowed (indeed required) to change. ``system.honest_kl_coef`` penalises
+    # KL(pi ‖ champion) on exactly these steps. ``None`` (the default, and every
+    # run that does not set ``env.kwargs.learn_mask``) means "no honest budget"
+    # and is an exact no-op — None is an empty pytree node, so the trajectory
+    # structure is unchanged.
+    honest_mask: Optional[chex.Array] = None
