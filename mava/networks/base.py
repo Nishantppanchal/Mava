@@ -240,7 +240,8 @@ class GatedResidualActor(nn.Module):
     [-0.0042, +0.0079], i.e. nothing.
 
     ``gate="soft"`` replaces the guarantee with a BUDGET. ``g`` is a learned
-    sigmoid, biased at ``gate_bias0`` (default -4.0, ~2 % open) so the policy
+    sigmoid, biased at ``gate_bias0`` (default 0.0, half open since §147: a nearly
+    closed gate times a zero-initialised head is a dead start) so the policy
     starts almost closed, and ``delta`` comes from a zero-initialised head, so
     at init ``merged`` equals the champion EXACTLY regardless of ``g`` and the
     first PPO ratio is 1. What keeps the honest cost small afterwards is not
@@ -275,7 +276,7 @@ class GatedResidualActor(nn.Module):
     hidden_state_dim: int = 128
     freeze_champion: bool = True
     gate: str = "hard"
-    gate_bias0: float = -4.0
+    gate_bias0: float = 0.0
     delta_clip: float = 5.0
     full_view: bool = False
 
