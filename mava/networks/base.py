@@ -225,6 +225,62 @@ class RecurrentActor(nn.Module):
         return policy_hidden_state, pi
 
 
+def mixture_logits(
+    champion_logits: chex.Array,
+    delta: chex.Array,
+    gate_logit: chex.Array,
+    action_mask: chex.Array,
+) -> chex.Array:
+    """Fork §147c: log-probabilities of ``(1 - g) * pi_champ + g * pi_res``.
+
+    ``pi_res = softmax(z_champ + delta)`` with ``delta`` UNCLIPPED, ``g =
+    sigmoid(gate_logit)``. Returned in LOGIT space (as an additive shift on the
+    champion's own masked logits) rather than as a normalised log-probability,
+    for one reason: at ``delta = 0`` the shift is EXACTLY ``0.0`` and the
+    returned array is bit-identical to ``champion_logits``, so the honest KL is
+    exactly zero at init and a graft's trajectories are the champion's. Adding
+    the shift to ``log_softmax(champion_logits)`` instead would be correct to
+    1e-7 and to nothing better, and §138's budget is a claim about zero.
+
+    With ``u = log pi_res - log pi_champ`` the shift is
+
+        log((1 - g) + g * exp(u))  -  log((1 - g) + g),
+
+    i.e. ``logaddexp(log(1-g), log(g) + u)`` minus the same expression at
+    ``u = 0``. The subtrahend is ``log(1) = 0`` in exact arithmetic and 1e-7 of
+    nothing in float32, so it costs no accuracy — it BUYS the identity: at
+    ``u = 0`` the two ``logaddexp`` calls have bit-identical arguments, so the
+    shift is ``x - x = 0.0`` exactly, and it also makes the gate's gradient
+    exactly zero at init (both terms move together), which is §145's ordering
+    — the head earns content before the gate can grant it authority.
+    ``delta = 0`` makes ``u`` exactly zero because both log-softmaxes then run
+    on bit-identical arrays.
+
+    Every piece is finite for every input. ``log_sigmoid`` never returns
+    ``-inf`` for a finite argument (it degrades to the argument itself), and
+    ``logaddexp`` of two finite numbers is finite with gradients that are
+    mixture responsibilities in [0, 1]. The obvious alternative,
+    ``log1p(g * expm1(u))``, is exact at ``u = 0`` too but hands back a NaN
+    gradient the moment ``g`` saturates to 1.0 and ``expm1(u)`` to -1.0 — both
+    of which are ordinary float32 values, reachable by a trained gate at
+    ``|gate_logit| > 17`` and a residual that wants an action gone.
+
+    Illegal actions carry ``finfo.min`` in both log-softmaxes, so ``u`` is
+    exactly zero there and the shift is zero; they are re-masked on the way out
+    regardless.
+    """
+    neg = jnp.finfo(jnp.float32).min
+    log_pc = jax.nn.log_softmax(champion_logits, axis=-1)
+    log_pr = jax.nn.log_softmax(
+        jnp.where(action_mask, champion_logits + delta, neg), axis=-1
+    )
+    u = log_pr - log_pc
+    log_g = jax.nn.log_sigmoid(gate_logit)
+    log_1mg = jax.nn.log_sigmoid(-gate_logit)
+    shift = jnp.logaddexp(log_1mg, log_g + u) - jnp.logaddexp(log_1mg, log_g)
+    return jnp.where(action_mask, champion_logits + shift, neg)
+
+
 class GatedResidualActor(nn.Module):
     """Fork §134/§138: a frozen champion plus a gated residual.
 
@@ -250,6 +306,26 @@ class GatedResidualActor(nn.Module):
     displacement. "Cannot regress" becomes "regresses by at most epsilon,
     measured" -- §138's decision, taken with the user.
 
+    ``gate="mix"`` (§147c) changes the ALGEBRA rather than the budget, and it
+    is the answer to §146f. Under both additive gates the residual can move a
+    logit by at most ``g * delta_clip``, so two actions' relative margin moves
+    by at most ``2 * g * delta_clip`` -- 4.8 at the shipped ``g = 0.48`` and
+    ``delta_clip = 5`` against a champion whose top-two margin is 3.5-5.5 at
+    entropy 0.19. Ten million steps of PPO produced a policy that was the
+    champion's on every evaluated row, in every arm. ``mix`` merges in
+    PROBABILITY space instead::
+
+        pi = (1 - g) * pi_champ + g * softmax(z_champ + delta)
+
+    with ``delta`` unclipped (``delta_clip`` is IGNORED under ``mix``; it stays
+    live for the two additive gates). The residual can now take the policy
+    over outright by driving ``g`` to 1, and the honest cost is bounded by ``g``
+    itself rather than by a clip -- a mixture with a champion is never further
+    from it than the mixture weight allows. What is unchanged is the init:
+    ``delta = 0`` makes ``pi_res = pi_champ``, so ``pi = pi_champ`` for ANY
+    ``g``, exactly, and the honest KL starts at 0 whatever the gate bias is.
+    See ``mixture_logits`` for why that identity is exact and not approximate.
+
     ``full_view`` (§138/WP3) decides what the residual READS. The §134f
     residual saw only the tail window, which is enough to notice a liar and
     nothing like enough to do anything about one: a policy that cannot see its
@@ -264,8 +340,13 @@ class GatedResidualActor(nn.Module):
     grafts in unchanged. The recurrent carry is the champion's, so every
     evaluator, renderer and probe works untouched.
 
-    Sows ``gate`` and ``champion_logits`` into "intermediates" for the loss
-    (the honest-episode KL needs the reference logits) and for logging.
+    Sows ``gate``, ``delta`` and ``champion_logits`` into "intermediates" for
+    the loss (the honest-episode KL needs the reference logits) and for logging.
+    ``delta`` is the EFFECTIVE displacement -- post-clip under ``soft``, the raw
+    head under ``hard`` and ``mix`` -- and the trainer logs ``delta_abs_mean``
+    from it. §146f had to GUESS whether the inert adapter had a delta that grew
+    without flipping an argmax or one that never left zero; that number is now
+    read rather than argued.
     """
 
     champion: nn.Module  # a RecurrentActor, frozen
@@ -286,9 +367,9 @@ class GatedResidualActor(nn.Module):
         policy_hidden_state: chex.Array,
         observation_done: RNNObservation,
     ) -> Tuple[chex.Array, tfd.Distribution]:
-        if self.gate not in ("hard", "soft"):
+        if self.gate not in ("hard", "soft", "mix"):
             raise ValueError(
-                f"residual.gate must be 'hard' or 'soft', got {self.gate!r}"
+                f"residual.gate must be 'hard', 'soft' or 'mix', got {self.gate!r}"
             )
         observation, done = observation_done
         view = observation.agents_view
@@ -334,35 +415,50 @@ class GatedResidualActor(nn.Module):
             name="residual_head",
         )(residual_out)
         alarm = tail[..., -1:]  # the env writes this LAST in the tail block
+        masked_champion = jnp.where(
+            observation.action_mask, logits, jnp.finfo(jnp.float32).min
+        )
         if self.gate == "hard":
             g = alarm
             delta = r
+            merged = jnp.where(
+                observation.action_mask,
+                logits + g * delta,
+                jnp.finfo(jnp.float32).min,
+            )
         else:
             # Zero kernel + constant bias: the gate is a pure function of the
             # bias at init (~2 % open at -4.0) and cannot depend on the input
             # until it has learned to, so the init identity holds for a reason
             # independent of the head's zero-init.
-            g = nn.sigmoid(
-                nn.Dense(
-                    1,
-                    kernel_init=nn.initializers.zeros,
-                    bias_init=nn.initializers.constant(self.gate_bias0),
-                    name="residual_gate",
-                )(residual_out)
-            )
-            delta = jnp.clip(r, -self.delta_clip, self.delta_clip)
-        masked_champion = jnp.where(
-            observation.action_mask, logits, jnp.finfo(jnp.float32).min
-        )
-        merged = jnp.where(
-            observation.action_mask,
-            logits + g * delta,
-            jnp.finfo(jnp.float32).min,
-        )
+            gate_logit = nn.Dense(
+                1,
+                kernel_init=nn.initializers.zeros,
+                bias_init=nn.initializers.constant(self.gate_bias0),
+                name="residual_gate",
+            )(residual_out)
+            g = nn.sigmoid(gate_logit)
+            if self.gate == "mix":
+                # §147c: no clip. A mixture is bounded by its own weight, so
+                # the clip has nothing left to protect and everything to cost —
+                # it is precisely what stopped the additive residual from ever
+                # overriding a confident champion.
+                delta = r
+                merged = mixture_logits(
+                    masked_champion, delta, gate_logit, observation.action_mask
+                )
+            else:
+                delta = jnp.clip(r, -self.delta_clip, self.delta_clip)
+                merged = jnp.where(
+                    observation.action_mask,
+                    logits + g * delta,
+                    jnp.finfo(jnp.float32).min,
+                )
         # Read by _actor_loss_fn (the honest-episode KL) and by the loggers.
         # Sowing is a no-op unless the caller passes mutable=["intermediates"],
         # so this costs the rollout nothing.
         self.sow("intermediates", "gate", g)
+        self.sow("intermediates", "delta", delta)
         self.sow("intermediates", "champion_logits", masked_champion)
         return policy_hidden_state, IdentityTransformation(
             distribution=tfd.Categorical(logits=merged)

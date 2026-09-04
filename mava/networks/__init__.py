@@ -22,5 +22,6 @@ from mava.networks.base import (
     RecurrentActor,
     RecurrentValueNet,
     ScannedRNN,
+    mixture_logits,
 )
 from mava.networks.sable_network import SableNetwork

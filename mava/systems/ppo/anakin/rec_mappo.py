@@ -351,8 +351,17 @@ def get_learner_fn(
                     # opts into the same mutable collection the §53 aux head
                     # uses. Both off = the stock single-return path, unchanged.
                     kl_coef = config.system.get("honest_kl_coef", 0.0)
-                    aux_pred = champion_logits = gate = None
-                    if aux_coef or kl_coef:
+                    # Fork §147c: the gate and |delta| telemetry must not
+                    # depend on a LOSS coefficient. §146f's partition sets
+                    # honest_kl_coef=0, and with the aux head also off the
+                    # sows were never read, so the run that most needed to say
+                    # whether delta had grown logged three zeros. A residual
+                    # run always takes the mutable path now; the forward pass
+                    # is the same computation either way.
+                    _rcfg = config.network.get("residual", None)
+                    residual_on = _rcfg is not None and _rcfg.get("enabled", False)
+                    aux_pred = champion_logits = gate = delta = None
+                    if aux_coef or kl_coef or residual_on:
                         ((_, actor_policy), inters) = actor_apply_fn(
                             actor_params,
                             traj_batch.hstates.policy_hidden_state[0],
@@ -363,6 +372,7 @@ def get_learner_fn(
                         aux_pred = _find_sown(sown, "aux_evader_pred")
                         champion_logits = _find_sown(sown, "champion_logits")
                         gate = _find_sown(sown, "gate")
+                        delta = _find_sown(sown, "delta")
                     else:
                         _, actor_policy = actor_apply_fn(
                             actor_params, traj_batch.hstates.policy_hidden_state[0], obs_and_done
@@ -437,7 +447,18 @@ def get_learner_fn(
                     honest_kl = jnp.float32(0.0)
                     gate_mean_honest = jnp.float32(0.0)
                     gate_mean_attacked = jnp.float32(0.0)
+                    # Fork §147c: mean |delta| over the batch — the residual's
+                    # CONTENT, separately from the authority the gate grants
+                    # it. Zero here says the head never left its zero init;
+                    # large here with the policy unmoved says the displacement
+                    # exists and the merge cannot spend it, which is exactly
+                    # the distinction §146f could not make. Defined for every
+                    # gate kind (it is the effective displacement: post-clip
+                    # under `soft`, the raw head under `hard` and `mix`).
+                    delta_abs_mean = jnp.float32(0.0)
                     hm = traj_batch.honest_mask
+                    if delta is not None:
+                        delta_abs_mean = jnp.abs(delta).mean()
                     if gate is not None:
                         g = gate[..., 0]
                         if hm is None:
@@ -462,6 +483,7 @@ def get_learner_fn(
                         honest_kl,
                         gate_mean_honest,
                         gate_mean_attacked,
+                        delta_abs_mean,
                     )
 
                 def _critic_loss_fn(
@@ -577,6 +599,7 @@ def get_learner_fn(
                     honest_kl,
                     gate_mean_honest,
                     gate_mean_attacked,
+                    delta_abs_mean,
                 ) = actor_loss_info
                 value_loss, (unscaled_value_loss, huber_frac, clip_frac) = (
                     value_loss_info
@@ -607,6 +630,9 @@ def get_learner_fn(
                     "honest_kl": honest_kl,
                     "gate_mean_honest": gate_mean_honest,
                     "gate_mean_attacked": gate_mean_attacked,
+                    # Fork §147c: mean |delta|, the residual's content. Reads
+                    # 0.0 on every run without a residual.
+                    "delta_abs_mean": delta_abs_mean,
                 }
 
                 return (new_params, new_opt_state, entropy_key), loss_info
