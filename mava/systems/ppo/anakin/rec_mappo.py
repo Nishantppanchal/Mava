@@ -795,7 +795,9 @@ def learner_setup(
         if tail_width <= 0:
             raise ValueError(
                 "network.residual.enabled needs the env's trust tail: set "
-                "env.kwargs.trust_tail=True (with trust_obs and belief_obs)"
+                "env.kwargs.trust_tail=True beside a belief block (belief_obs > 0 "
+                "or dbn_obs > 0). NOT trust_obs — it widens the actor too "
+                "and is refused here; use trust_obs_critic (§146g)"
             )
         config.system.tail_start = int(tail_start)
         config.system.tail_width = int(tail_width)
@@ -938,6 +940,35 @@ def learner_setup(
                 restored_params.actor_params
             )["params"]
             restored_params = restored_params._replace(actor_params=grafted)
+        # Fork §146g: the champion's CRITIC may not fit this run's critic.
+        # ``trust_obs=True`` widens ``global_state`` by 2N (the credibility row
+        # plus the ground-truth liar mask), which the residual arms need and
+        # the champion was not trained with. ``restore_params`` reads the
+        # checkpoint's own structure — it never consults ``input_params`` for
+        # shapes — so a width change is restored SILENTLY and only dies much
+        # later, inside the pmapped learner's trace, as a dot_general shape
+        # error with no mention of the checkpoint. On the residual path the
+        # champion is what the graft is for; the critic is trained from scratch
+        # at the adapter's budget anyway, so keep the freshly initialised one
+        # (its optimiser state is already the fresh one) and say so.
+        if residual_on:
+            flat = flax.traverse_util.flatten_dict
+            fresh_c = {k: jnp.shape(v) for k, v in flat(critic_params).items()}
+            rest_c = {
+                k: jnp.shape(v) for k, v in flat(restored_params.critic_params).items()
+            }
+            moved = sorted(k for k in fresh_c if fresh_c[k] != rest_c.get(k))
+            if moved or set(rest_c) - set(fresh_c):
+                k0 = moved[0] if moved else sorted(set(rest_c) - set(fresh_c))[0]
+                was, now = rest_c.get(k0), fresh_c.get(k0)
+                print(
+                    f"{Fore.YELLOW}{Style.BRIGHT}Critic re-initialised: "
+                    f"width {was} -> {now} at {'/'.join(map(str, k0))} "
+                    "(e.g. env.kwargs.trust_obs) — the checkpoint's critic does "
+                    f"not fit this run; restoring the champion actor only."
+                    f"{Style.RESET_ALL}"
+                )
+                restored_params = restored_params._replace(critic_params=critic_params)
         params = restored_params
         if restored_hstates is not None:
             fresh_shapes = jax.tree_util.tree_map(lambda x: x.shape, hstates)
