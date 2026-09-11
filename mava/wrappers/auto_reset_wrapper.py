@@ -42,10 +42,28 @@ class AutoResetWrapper(Wrapper):
 
     # This init isn't really needed as jumanji.Wrapper will forward the attributes,
     # but mypy doesn't realize this.
-    def __init__(self, env: MarlEnv):
+    def __init__(self, env: MarlEnv, defer_reset: bool = False):
+        """Fork (pursuit DESIGN §148s / WP9): ``defer_reset`` splits ``step``.
+
+        With ``defer_reset=False`` — the default, and the stock behaviour —
+        ``step`` is exactly what it always was: env step, latch
+        ``real_next_obs`` into extras, then the unconditional reset + per-leaf
+        select.
+
+        With ``defer_reset=True`` ``step`` stops after the latch and the reset
+        tail is exposed as :meth:`finish_auto_reset`, so that
+        :class:`BatchAutoResetWrapper` can run it OUTSIDE the per-env ``vmap``
+        under a ``lax.cond`` on ``jnp.any(done)``. Deferring is exact rather
+        than approximate: the tail reads only ``state.key`` and
+        ``timestep.observation``, while the wrapper it is deferred past
+        (``RecordEpisodeMetrics``) reads only ``timestep.reward`` and
+        ``timestep.step_type`` and threads the env state through untouched — so
+        the two orderings commute bit for bit.
+        """
         super().__init__(env)
         self._env: MarlEnv
 
+        self.defer_reset = defer_reset
         self.num_agents = self._env.num_agents
         self.time_limit = self._env.time_limit
         self.action_dim = self._env.action_dim
@@ -105,9 +123,22 @@ class AutoResetWrapper(Wrapper):
         # Both paths of the old cond stored the pre-reset observation in extras.
         state, timestep = self._obs_in_extras(state, timestep)
 
-        # Unconditional reset (same key discipline as the old _auto_reset), then
-        # select per leaf. Under vmap `done` is a scalar per environment, so the
-        # where broadcasts over every leaf shape.
+        # Fork (§148s / WP9): with ``defer_reset`` the tail below is run later,
+        # once per BATCH, by ``BatchAutoResetWrapper``.
+        if self.defer_reset:
+            return state, timestep
+
+        return self.finish_auto_reset(state, timestep)
+
+    def finish_auto_reset(
+        self, state: State, timestep: TimeStep[Observation]
+    ) -> Tuple[State, TimeStep[Observation]]:
+        """The reset tail of :meth:`step`, verbatim, as a separate method.
+
+        Unconditional reset (same key discipline as the old ``_auto_reset``),
+        then select per leaf. Under ``vmap`` ``done`` is a scalar per
+        environment, so the where broadcasts over every leaf shape.
+        """
         key, _ = jax.random.split(state.key)  # type: ignore
         reset_state, reset_timestep = self._env.reset(key)
 
@@ -124,3 +155,83 @@ class AutoResetWrapper(Wrapper):
         )
 
         return state, timestep
+
+
+class BatchAutoResetWrapper(Wrapper):
+    """Batch-level conditional auto-reset — the OUTERMOST wrapper of the train stack.
+
+    Fork-only (pursuit DESIGN §148s / WP9). ``AutoResetWrapper`` pays a full
+    ``env.reset`` on every env on every step so that a per-leaf ``where`` can
+    select it; §148n measured that at 40 % of the belief arm's step cost while
+    being needed on well under 1 % of env-steps (episodes ~800 steps). This
+    wrapper takes BATCHED state/action, does the per-env work under one
+    ``jax.vmap``, and then runs the deferred reset tail of the inner
+    ``AutoResetWrapper`` under ``jax.lax.cond(jnp.any(done), ...)``. With 128
+    envs and ~800-step episodes the reset branch runs on ~15 % of steps instead
+    of 100 %, and the result is bit-identical to the old stack on every step
+    (the false branch is the identity, which is what the old per-leaf
+    ``where`` computed when no env was done).
+
+    THE CONSTRAINT (DESIGN §30, and the note on ``AutoResetWrapper.step``): the
+    predicate must be a TRUE SCALAR. Under ``jax.vmap`` a ``cond`` becomes a
+    ``select`` — both branches run, nothing is saved — and, worse, JAX's cond
+    batching rule broadcasts branch closure constants into batched operands,
+    which tiled the 1.07 GiB BFS table x num_envs last time. So this wrapper
+    must never be used inside a ``vmap``: ``rec_mappo`` detects
+    ``batched_step`` and skips its own ``jax.vmap(env.step)``, and refuses to
+    run with ``system.update_batch_size > 1`` (which would vmap the whole
+    update step around it). ``pmap`` over devices is fine — each device sees a
+    scalar predicate.
+
+    ``reset`` is batched too (it takes a batch of keys), so the caller's stack
+    is symmetric.
+    """
+
+    #: Read by ``rec_mappo`` to skip its own per-env ``jax.vmap``.
+    batched_step = True
+
+    def __init__(self, env: MarlEnv):
+        super().__init__(env)
+        self._env: MarlEnv
+
+        if not getattr(env, "defer_reset", False):
+            raise ValueError(
+                "BatchAutoResetWrapper must wrap a stack containing an "
+                "AutoResetWrapper built with defer_reset=True — otherwise the "
+                "inner wrapper still resets every env on every step and this "
+                "wrapper would reset them a second time."
+            )
+
+        self.num_agents = self._env.num_agents
+        self.time_limit = self._env.time_limit
+        self.action_dim = self._env.action_dim
+
+    def reset(self, keys: chex.PRNGKey) -> Tuple[State, TimeStep[Observation]]:
+        """Reset a BATCH of environments, one per key in ``keys``."""
+        return jax.vmap(self._env.reset)(keys)
+
+    def step(self, states: State, actions: chex.Array) -> Tuple[State, TimeStep[Observation]]:
+        """Step a BATCH of environments, resetting only if some env is done."""
+        states, timesteps = jax.vmap(self._env.step)(states, actions)
+
+        # ``finish_auto_reset`` is forwarded through the inner wrappers by
+        # ``jumanji.Wrapper.__getattr__`` (each one threads it through its own
+        # state), so this reaches the deferred ``AutoResetWrapper``.
+        finish = self._env.finish_auto_reset
+
+        def reset_and_select(
+            operand: Tuple[State, TimeStep[Observation]],
+        ) -> Tuple[State, TimeStep[Observation]]:
+            return jax.vmap(finish)(*operand)
+
+        def identity(
+            operand: Tuple[State, TimeStep[Observation]],
+        ) -> Tuple[State, TimeStep[Observation]]:
+            return operand
+
+        return jax.lax.cond(
+            jnp.any(timesteps.last()),
+            reset_and_select,
+            identity,
+            (states, timesteps),
+        )

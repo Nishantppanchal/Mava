@@ -187,6 +187,34 @@ def get_learner_fn(
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
 
+    # Fork (pursuit DESIGN §148s / WP9). ``BatchAutoResetWrapper`` steps a whole
+    # batch of envs itself so that the auto-reset can hide behind one
+    # ``lax.cond(jnp.any(done), ...)``; when it is in the stack we must NOT vmap
+    # ``env.step`` here, and the whole update step must NOT be vmapped either
+    # (a cond under vmap is a select — both branches run — and its batching rule
+    # broadcasts branch closure constants, which tiled the BFS table x num_envs
+    # in §30). ``update_batch_size == 1`` in every recipe in this repo, so we
+    # simply call ``_update_step`` directly and keep the vmap for the > 1 case.
+    batched_env = bool(getattr(env, "batched_step", False))
+    use_batch_axis = config.system.update_batch_size > 1
+    if batched_env and use_batch_axis:
+        raise ValueError(
+            "system.update_batch_size > 1 cannot be combined with a batched "
+            "auto-reset env: vmapping the update step would put the wrapper's "
+            "lax.cond under a vmap, which turns it back into a select AND "
+            "broadcasts its closure constants (DESIGN §30). Set "
+            "system.batch_auto_reset=False or system.update_batch_size=1."
+        )
+
+    def _pmean_batch(x: Any) -> Any:
+        """pmean over the update-batch axis — a no-op when there isn't one.
+
+        With ``update_batch_size == 1`` the axis is gone (``learner_fn`` calls
+        ``_update_step`` directly) and the mean of one element is that element,
+        so skipping it is exact.
+        """
+        return jax.lax.pmean(x, axis_name="batch") if use_batch_axis else x
+
     def _update_step(learner_state: RNNLearnerState, _: Any) -> Tuple[RNNLearnerState, Tuple]:
         """A single update of the network.
 
@@ -243,8 +271,19 @@ def get_learner_fn(
 
             action, log_prob, value = action.squeeze(0), log_prob.squeeze(0), value.squeeze(0)
 
-            # Step the environment.
-            env_state, timestep = jax.vmap(env.step, in_axes=(0, 0))(env_state, action)
+            # Step the environment. A ``BatchAutoResetWrapper`` env steps the
+            # whole batch itself (fork §148s / WP9); everything else is per-env.
+            if batched_env:
+                env_state, timestep = env.step(env_state, action)
+            else:
+                env_state, timestep = jax.vmap(env.step, in_axes=(0, 0))(env_state, action)
+
+            # Fork §148s: the fraction of rollout steps on which ANY env was
+            # done — i.e. the fraction that actually paid for a reset. This is
+            # exactly the batch wrapper's cond predicate, so logging its mean
+            # per update is what explains the speed-up (and what would show a
+            # regression if episodes ever got short enough to defeat it).
+            reset_branch = jnp.any(timestep.last())
 
             done = timestep.last().repeat(env.num_agents).reshape(config.arch.num_envs, -1)
             # ``timestep.discount`` is the post-step discount from the env: 0 on
@@ -295,12 +334,14 @@ def get_learner_fn(
                 params, opt_states, key, env_state, timestep, done, hstates
             )
             metrics = timestep.extras["episode_metrics"] | timestep.extras["env_metrics"]
-            return learner_state, (transition, step_discount, next_val, metrics)
+            return learner_state, (transition, step_discount, next_val, metrics, reset_branch)
 
         # Step environment for rollout length
-        learner_state, (traj_batch, discount_traj, next_val_traj, episode_metrics) = jax.lax.scan(
-            _env_step, learner_state, None, config.system.rollout_length
-        )
+        (
+            learner_state,
+            (traj_batch, discount_traj, next_val_traj, episode_metrics, reset_branch_traj),
+        ) = jax.lax.scan(_env_step, learner_state, None, config.system.rollout_length)
+        reset_branch_frac = jnp.mean(reset_branch_traj.astype(jnp.float32))
 
         # Calculate advantage
         params, opt_states, key, env_state, last_timestep, last_done, hstates = learner_state
@@ -562,16 +603,16 @@ def get_learner_fn(
 
                 # Compute the parallel mean (pmean) over the batch.
                 # This pmean could be a regular mean as the batch axis is on the same device.
-                actor_grads, actor_loss_info = jax.lax.pmean(
-                    (actor_grads, actor_loss_info), axis_name="batch"
+                actor_grads, actor_loss_info = _pmean_batch(
+                    (actor_grads, actor_loss_info)
                 )
                 # pmean over devices.
                 actor_grads, actor_loss_info = jax.lax.pmean(
                     (actor_grads, actor_loss_info), axis_name="device"
                 )
 
-                critic_grads, value_loss_info = jax.lax.pmean(
-                    (critic_grads, value_loss_info), axis_name="batch"
+                critic_grads, value_loss_info = _pmean_batch(
+                    (critic_grads, value_loss_info)
                 )
                 # pmean over devices.
                 critic_grads, value_loss_info = jax.lax.pmean(
@@ -695,6 +736,12 @@ def get_learner_fn(
         )
 
         params, opt_states, traj_batch, advantages, targets, key = update_state
+        # Fork §148s: broadcast to the loss_info leaf shape (ppo_epochs,
+        # num_minibatches) so the logger's mean over train metrics is the
+        # rollout's reset-branch fraction.
+        loss_info["reset_branch_frac"] = jnp.full_like(
+            loss_info["total_loss"], reset_branch_frac
+        )
         learner_state = RNNLearnerState(
             params,
             opt_states,
@@ -725,7 +772,22 @@ def get_learner_fn(
                 - hstates (HiddenStates): The hidden state of the policy and critic RNN.
 
         """
-        batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
+        if use_batch_axis:
+            batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
+        else:
+            # Fork §148s / WP9: with update_batch_size == 1 the vmap exists only
+            # to carry a size-1 axis, and it is precisely what would turn
+            # ``BatchAutoResetWrapper``'s ``lax.cond`` back into a select. Drop
+            # it and move the leading axis by hand; ``_pmean_batch`` already
+            # skips the (size-1, hence identity) pmean over it.
+            def batched_update_step(
+                learner_state: RNNLearnerState, xs: Any
+            ) -> Tuple[RNNLearnerState, Tuple]:
+                inner_state, out = _update_step(tree.map(lambda x: x[0], learner_state), xs)
+                return (
+                    tree.map(lambda x: x[jnp.newaxis], inner_state),
+                    tree.map(lambda x: x[jnp.newaxis], out),
+                )
 
         # Number of updates per ``learn`` call = the train-metric logging window.
         # Defaults to the full eval window (one train-log per eval); set
@@ -980,9 +1042,14 @@ def learner_setup(
     key, *env_keys = jax.random.split(
         key, n_devices * config.system.update_batch_size * config.arch.num_envs + 1
     )
-    env_states, timesteps = jax.vmap(env.reset, in_axes=(0))(
-        jnp.stack(env_keys),
-    )
+    # Fork §148s / WP9: a ``BatchAutoResetWrapper`` env resets a batch of keys
+    # itself; everything else is per-env and gets the vmap as before.
+    if getattr(env, "batched_step", False):
+        env_states, timesteps = env.reset(jnp.stack(env_keys))
+    else:
+        env_states, timesteps = jax.vmap(env.reset, in_axes=(0))(
+            jnp.stack(env_keys),
+        )
     reshape_states = lambda x: x.reshape(
         (n_devices, config.system.update_batch_size, config.arch.num_envs) + x.shape[1:]
     )

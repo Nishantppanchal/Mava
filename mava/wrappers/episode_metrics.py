@@ -111,6 +111,26 @@ class RecordEpisodeMetrics(Wrapper):
         )
         return state, timestep
 
+    def finish_auto_reset(
+        self,
+        state: RecordEpisodeMetricsState,
+        timestep: TimeStep,
+    ) -> Tuple[RecordEpisodeMetricsState, TimeStep]:
+        """Thread ``AutoResetWrapper``'s deferred reset tail through this state.
+
+        Fork (pursuit DESIGN §148s / WP9). ``BatchAutoResetWrapper`` runs the
+        inner ``AutoResetWrapper``'s reset tail once per BATCH, after this
+        wrapper has already stepped. That reordering is exact: the tail touches
+        only ``state.env_state`` and ``timestep.observation``, while ``step``
+        above reads only ``timestep.reward`` and ``timestep.step_type`` and
+        passes ``env_state`` through opaquely — so the episode counters are the
+        same either way, and this wrapper's own leaves (``key`` and the
+        running/final return and length) are deliberately left alone, exactly
+        as when the auto-reset ran inside.
+        """
+        env_state, timestep = self._env.finish_auto_reset(state.env_state, timestep)
+        return state.replace(env_state=env_state), timestep
+
 
 def get_final_step_metrics(metrics: Dict[str, chex.Array]) -> Tuple[Dict[str, chex.Array], bool]:
     """Get the metrics for the final step of an episode and check if there was a final step
