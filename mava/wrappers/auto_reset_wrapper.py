@@ -171,15 +171,19 @@ class BatchAutoResetWrapper(Wrapper):
     of 100 %. The false branch is the identity, which is exactly what the old
     per-leaf ``where`` computed when no env was done.
 
-    HOW CLOSE TO THE OLD STACK, measured (pursuit ``tests/test_wp9_batch_reset``):
-    state, reward, discount, step_type, extras and the actor observation are
-    bit-identical on every step. ONE residue remains, and it is the cond's, not
-    the deferral's: JAX lifts a branch's closure constants into operands of the
-    conditional, so a constant divisor that XLA would otherwise fold into a
-    reciprocal multiply stays a division inside the branch. In the pursuit env
-    that is one float32 ULP in the privileged critic vector, on reset steps
-    only. Running the same deferred tail WITHOUT the cond reproduces the old
-    stack on every leaf, which is what pins the cause.
+    BIT-IDENTICAL TO THE OLD STACK, measured leaf by leaf (pursuit
+    ``tests/test_wp9_batch_reset``): state, reward, discount, step_type, extras
+    and both halves of the observation, at G=25 and G=200, 64 envs x 300 steps.
+
+    Getting there needed one thing from the env, and it is worth knowing about
+    before wrapping a different one. JAX lifts a branch's closure constants into
+    OPERANDS of the conditional, and XLA's algebraic simplifier folds ``x / c``
+    into ``x * (1/c)`` only while ``c`` is a constant — so a constant divisor
+    inside the branch stays a true division while the same expression outside it
+    became a multiply. The pursuit env's critic vector had three such divisors
+    and now writes the multiply itself (``_bfs_large_recip``). If a future env
+    shows a last-ULP difference under this wrapper, that is the shape of it: fix
+    the source expression, don't loosen the test.
 
     THE CONSTRAINT (DESIGN §30, and the note on ``AutoResetWrapper.step``): the
     predicate must be a TRUE SCALAR. Under ``jax.vmap`` a ``cond`` becomes a
