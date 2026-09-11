@@ -168,9 +168,18 @@ class BatchAutoResetWrapper(Wrapper):
     ``jax.vmap``, and then runs the deferred reset tail of the inner
     ``AutoResetWrapper`` under ``jax.lax.cond(jnp.any(done), ...)``. With 128
     envs and ~800-step episodes the reset branch runs on ~15 % of steps instead
-    of 100 %, and the result is bit-identical to the old stack on every step
-    (the false branch is the identity, which is what the old per-leaf
-    ``where`` computed when no env was done).
+    of 100 %. The false branch is the identity, which is exactly what the old
+    per-leaf ``where`` computed when no env was done.
+
+    HOW CLOSE TO THE OLD STACK, measured (pursuit ``tests/test_wp9_batch_reset``):
+    state, reward, discount, step_type, extras and the actor observation are
+    bit-identical on every step. ONE residue remains, and it is the cond's, not
+    the deferral's: JAX lifts a branch's closure constants into operands of the
+    conditional, so a constant divisor that XLA would otherwise fold into a
+    reciprocal multiply stays a division inside the branch. In the pursuit env
+    that is one float32 ULP in the privileged critic vector, on reset steps
+    only. Running the same deferred tail WITHOUT the cond reproduces the old
+    stack on every leaf, which is what pins the cause.
 
     THE CONSTRAINT (DESIGN §30, and the note on ``AutoResetWrapper.step``): the
     predicate must be a TRUE SCALAR. Under ``jax.vmap`` a ``cond`` becomes a
