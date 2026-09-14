@@ -401,8 +401,13 @@ def get_learner_fn(
                     # is the same computation either way.
                     _rcfg = config.network.get("residual", None)
                     residual_on = _rcfg is not None and _rcfg.get("enabled", False)
+                    # Fork §148y: the learned target gate sows too, and its
+                    # telemetry must not depend on a loss coefficient either.
+                    _tcfg = config.network.get("target_gate", None)
+                    tgate_on = _tcfg is not None and _tcfg.get("enabled", False)
                     aux_pred = champion_logits = gate = delta = None
-                    if aux_coef or kl_coef or residual_on:
+                    tgate = tgate_h0 = tgate_k = None
+                    if aux_coef or kl_coef or residual_on or tgate_on:
                         ((_, actor_policy), inters) = actor_apply_fn(
                             actor_params,
                             traj_batch.hstates.policy_hidden_state[0],
@@ -414,6 +419,9 @@ def get_learner_fn(
                         champion_logits = _find_sown(sown, "champion_logits")
                         gate = _find_sown(sown, "gate")
                         delta = _find_sown(sown, "delta")
+                        tgate = _find_sown(sown, "target_gate")
+                        tgate_h0 = _find_sown(sown, "tgate_h0")
+                        tgate_k = _find_sown(sown, "tgate_k")
                     else:
                         _, actor_policy = actor_apply_fn(
                             actor_params, traj_batch.hstates.policy_hidden_state[0], obs_and_done
@@ -509,6 +517,17 @@ def get_learner_fn(
                             gate_mean_honest = jnp.sum(g * hw) / (jnp.sum(hw) + 1e-8)
                             aw = 1.0 - hw
                             gate_mean_attacked = jnp.sum(g * aw) / (jnp.sum(aw) + 1e-8)
+                    # Fork §148y: the learned target gate's telemetry — what
+                    # fraction of the belief target the policy is actually
+                    # letting through, and where its threshold and sharpness
+                    # have moved to. All three read 0.0 without the gate.
+                    target_gate_mean = jnp.float32(0.0)
+                    target_gate_h0 = jnp.float32(0.0)
+                    target_gate_k = jnp.float32(0.0)
+                    if tgate is not None:
+                        target_gate_mean = jnp.mean(tgate)
+                        target_gate_h0 = jnp.reshape(tgate_h0, ())
+                        target_gate_k = jnp.reshape(tgate_k, ())
                     if kl_coef and champion_logits is not None:
                         honest_kl = masked_policy_kl(
                             actor_policy.distribution.logits,
@@ -525,6 +544,9 @@ def get_learner_fn(
                         gate_mean_honest,
                         gate_mean_attacked,
                         delta_abs_mean,
+                        target_gate_mean,
+                        target_gate_h0,
+                        target_gate_k,
                     )
 
                 def _critic_loss_fn(
@@ -641,6 +663,9 @@ def get_learner_fn(
                     gate_mean_honest,
                     gate_mean_attacked,
                     delta_abs_mean,
+                    target_gate_mean,
+                    target_gate_h0,
+                    target_gate_k,
                 ) = actor_loss_info
                 value_loss, (unscaled_value_loss, huber_frac, clip_frac) = (
                     value_loss_info
@@ -674,6 +699,15 @@ def get_learner_fn(
                     # Fork §147c: mean |delta|, the residual's content. Reads
                     # 0.0 on every run without a residual.
                     "delta_abs_mean": delta_abs_mean,
+                    # Fork §148y: the LEARNED entropy gate on the belief
+                    # target. `target_gate_mean` is how much of the target the
+                    # policy lets through on average; `_h0` and `_k` are the
+                    # threshold and the sharpness it has trained them to, which
+                    # is the whole point of the ablation (the hard gate's 0.98
+                    # was a swept constant). 0.0 on every run without the gate.
+                    "target_gate_mean": target_gate_mean,
+                    "target_gate_h0": target_gate_h0,
+                    "target_gate_k": target_gate_k,
                 }
 
                 return (new_params, new_opt_state, entropy_key), loss_info
@@ -836,6 +870,27 @@ def learner_setup(
     # so the champion has to hand it back. Params are identical either way.
     residual_full_view = residual_on and bool(residual_cfg.get("full_view", False))
 
+    # Fork §148y: the LEARNED target gate. The slices come from the env's own
+    # layout table (the same mechanism as the residual's tail window below), so
+    # a block added to `agents_view` cannot silently slide the gated columns.
+    tgate_cfg = config.network.get("target_gate", None)
+    tgate_on = tgate_cfg is not None and tgate_cfg.get("enabled", False)
+    tgate_targets: Tuple[Tuple[int, int], ...] = ()
+    tgate_conf: Tuple[Tuple[int, int], ...] = ()
+    if tgate_on:
+        tgate_targets = tuple(
+            (int(s), int(w)) for s, w in env.unwrapped.actor_target_slices
+        )
+        tgate_conf = tuple((int(s), int(w)) for s, w in env.unwrapped.actor_conf_slice)
+        if not tgate_targets or not tgate_conf:
+            raise ValueError(
+                "network.target_gate.enabled needs the env's belief-mode block "
+                "and the routing family: set env.kwargs.belief_modes_obs>0 with "
+                "fused_sighting/route_to_sighting/route_to_predicted"
+            )
+        config.system.target_slices = [list(p) for p in tgate_targets]
+        config.system.conf_slices = [list(p) for p in tgate_conf]
+
     actor_network = Actor(
         pre_torso=actor_pre_torso,
         post_torso=actor_post_torso,
@@ -846,6 +901,14 @@ def learner_setup(
         # Fork §53: aux evader-prediction head, on iff the loss uses it.
         aux_predict=bool(config.system.get("aux_predict_coef", 0.0)),
         return_core=residual_full_view,
+        # Fork §148y: absent (no params, bit-identical tree) unless enabled.
+        target_gate=bool(tgate_on),
+        target_slices=tgate_targets,
+        conf_slices=tgate_conf,
+        gate_init_threshold=float(
+            tgate_cfg.get("init_threshold", 0.98) if tgate_on else 0.98
+        ),
+        gate_init_slope=float(tgate_cfg.get("init_slope", 200.0) if tgate_on else 200.0),
     )
     # Fork §134 Layer 3: wrap the champion in a gated residual. The residual
     # is the only trainable part and it is multiplied by a hard 0/1 alarm the

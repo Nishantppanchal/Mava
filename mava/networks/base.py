@@ -18,6 +18,7 @@ from typing import Sequence, Tuple, Union
 import chex
 import jax
 import jax.numpy as jnp
+import numpy as np
 import tensorflow_probability.substrates.jax.distributions as tfd
 from flax import linen as nn
 from flax.linen.initializers import orthogonal
@@ -174,6 +175,34 @@ class RecurrentActor(nn.Module):
     cannot be read back inside the same forward pass, and re-running the
     champion would double the cost. Params are untouched by the flag, so a
     checkpoint grafts in either way.
+
+    Fork §148y: ``target_gate`` is the LEARNED, differentiable replacement for
+    the environment's hard entropy gate (``env.kwargs.belief_target_entropy_max``,
+    §148m). Before the pre-torso the actor computes, per agent and per step,
+
+        g = sigmoid(k * (h0 - H) + w . c + b)
+
+    with ``H`` the row marginal's normalised entropy and ``c`` the remaining
+    confidence features (the mode's basin mass, the credibility of the reporter
+    whose claim is nearest it, own-sensor agreement, the fused sighting's
+    freshness) — both read from ``conf_slices``, which the ENV derives from its
+    own layout table (``PursuitEvasionEnvMava.actor_conf_slice``; the entropy
+    range is LAST by contract). Every column in ``target_slices`` is then
+    multiplied by ``g``; the confidence columns themselves are left UNGATED, so
+    the gate can always see what it is deciding on, and no other column moves.
+
+    ``k``, ``h0``, ``w`` and ``b`` are learnable and initialised at
+    ``gate_init_slope``, ``gate_init_threshold``, 0 and 0, so at init the
+    module reproduces the hard gate: at ``k = 200`` and ``h0 = 0.98`` a row at
+    H = 0.90 passes at g > 0.999 and one at H = 1.0 is 98 % closed
+    (sigmoid(-4) = 0.018). What it BUYS over the hard gate is a gradient: the
+    threshold, the sharpness and a linear correction on the other confidence
+    features are all trained by the policy loss, so "when is a belief target
+    worth following" stops being a swept constant.
+
+    The flag is OBS-NEUTRAL (no width moves) and, when False, creates NO
+    params — the tree and every output are bit-identical to plain
+    ``rnn_pursuit``, which is the ablation's control.
     """
 
     pre_torso: nn.Module
@@ -183,6 +212,60 @@ class RecurrentActor(nn.Module):
     temporal_core: str = "gru"
     aux_predict: bool = False
     return_core: bool = False
+    # Fork §148y. Slices are (start, width) pairs in the env's own layout,
+    # handed down by learner_setup exactly as GatedResidualActor's tail is.
+    target_gate: bool = False
+    target_slices: Tuple[Tuple[int, int], ...] = ()
+    conf_slices: Tuple[Tuple[int, int], ...] = ()
+    gate_init_threshold: float = 0.98
+    gate_init_slope: float = 200.0
+
+    def _gate_targets(self, view: chex.Array) -> chex.Array:
+        """Fork §148y: scale the target-derived columns of ``view`` by ``g``.
+
+        Built as a multiplicative MASK over the full width rather than a
+        scatter of slices: the confidence columns live INSIDE the belief-mode
+        block (which is itself a target block), so "gate the targets, not the
+        confidence" is one vector of 1s and gs and not an ordering puzzle.
+        """
+        if not self.target_slices or not self.conf_slices:
+            raise ValueError(
+                "network.target_gate.enabled needs the env's target and "
+                "confidence slices: set env.kwargs.belief_modes_obs > 0 beside "
+                "the routing family (fused_sighting, route_to_*)"
+            )
+        conf = jnp.concatenate(
+            [view[..., s : s + w] for s, w in self.conf_slices], axis=-1
+        )
+        # The entropy range is LAST by the env-side contract, so H needs no
+        # second copy of the belief-mode slot's offsets here.
+        entropy, rest = conf[..., -1:], conf[..., :-1]
+        k = self.param(
+            "tgate_k", nn.initializers.constant(self.gate_init_slope), (), jnp.float32
+        )
+        h0 = self.param(
+            "tgate_h0",
+            nn.initializers.constant(self.gate_init_threshold),
+            (),
+            jnp.float32,
+        )
+        w = self.param(
+            "tgate_w", nn.initializers.zeros, (rest.shape[-1],), jnp.float32
+        )
+        b = self.param("tgate_b", nn.initializers.zeros, (), jnp.float32)
+        logit = k * (h0 - entropy) + jnp.sum(rest * w, axis=-1, keepdims=True) + b
+        g = nn.sigmoid(logit)
+        mask = np.zeros((view.shape[-1],), dtype=np.float32)
+        for s, wd in self.target_slices:
+            mask[s : s + wd] = 1.0
+        for s, wd in self.conf_slices:
+            mask[s : s + wd] = 0.0
+        # Read by the learner's telemetry (target_gate_mean / _h0 / _k). Sowing
+        # is a no-op unless the caller passes mutable=["intermediates"].
+        self.sow("intermediates", "target_gate", g)
+        self.sow("intermediates", "tgate_h0", h0)
+        self.sow("intermediates", "tgate_k", k)
+        return view * (1.0 + jnp.asarray(mask) * (g - 1.0))
 
     @nn.compact
     def __call__(
@@ -198,7 +281,10 @@ class RecurrentActor(nn.Module):
             policy_embedding = self.pre_torso(observation)
             action_mask = observation.observation.action_mask
         else:
-            policy_embedding = self.pre_torso(observation.agents_view)
+            view = observation.agents_view
+            if self.target_gate:
+                view = self._gate_targets(view)
+            policy_embedding = self.pre_torso(view)
             action_mask = observation.action_mask
 
         policy_rnn_input = (policy_embedding, done)
