@@ -153,12 +153,12 @@ class ScannedRNN(nn.Module):
 class RecurrentActor(nn.Module):
     """Recurrent Actor Network.
 
-    Fork §51/§97: ``temporal_core`` selects the memory module. Only "gru"
-    (stock ScannedRNN, the default) remains: the §51/§53 window-attention and
-    SSM cores were removed in §97 and the §80 phase-gated dual-timescale core
-    in WP10 (all three closed negative, DESIGN §80/§82b) — git history has them.
+    Fork: ``temporal_core`` selects the memory module. Only "gru"
+    (stock ScannedRNN, the default) remains — window-attention, SSM and
+    phase-gated dual-timescale cores were all tried, all closed negative and
+    all deleted; git history has them.
 
-    Fork §53: ``aux_predict`` adds an auxiliary evader-position head off the
+    Fork: ``aux_predict`` adds an auxiliary evader-position head off the
     temporal core (Dense(2) on the recurrent embedding), exposed ONLY via
     flax's "intermediates" sow — the (hstate, pi) return contract is
     untouched, so every existing consumer (evaluator, render, BC, eval
@@ -167,16 +167,17 @@ class RecurrentActor(nn.Module):
     future evader position (dense hindsight signal shaping the shared
     representation toward route prediction).
 
-    Fork §138/WP3: ``return_core`` makes ``__call__`` return a THIRD element,
-    the post-GRU core embedding (the same tensor the §53 aux head reads, before
+    Fork: ``return_core`` makes ``__call__`` return a THIRD element,
+    the post-GRU core embedding (the same tensor the aux head reads, before
     ``post_torso``) — the only way to read that tensor inside the forward pass
     that produced it, since a sow cannot be read back. Its original consumer,
-    the residual adapter, was removed in WP10. Params are untouched by the
+    a residual adapter, is gone. Params are untouched by the
     flag, so a checkpoint grafts in either way.
 
-    Fork §148y: ``target_gate`` is the LEARNED, differentiable replacement for
-    the environment's hard entropy gate (``env.kwargs.belief_target_entropy_max``,
-    §148m). Before the pre-torso the actor computes, per agent and per step,
+    Fork: ``target_gate`` is the LEARNED, differentiable replacement for the
+    environment's hard entropy gate
+    (``env.kwargs.belief_target_entropy_max``). Before the pre-torso the actor
+    computes, per agent and per step,
 
         g = sigmoid(k * (h0 - H) + w . c + b)
 
@@ -210,7 +211,7 @@ class RecurrentActor(nn.Module):
     temporal_core: str = "gru"
     aux_predict: bool = False
     return_core: bool = False
-    # Fork §148y. Slices are (start, width) pairs in the env's own layout,
+    # Fork. Slices are (start, width) pairs in the env's own layout,
     # handed down by learner_setup from that layout table.
     target_gate: bool = False
     target_slices: Tuple[Tuple[int, int], ...] = ()
@@ -219,7 +220,7 @@ class RecurrentActor(nn.Module):
     gate_init_slope: float = 200.0
 
     def _gate_targets(self, view: chex.Array) -> chex.Array:
-        """Fork §148y: scale the target-derived columns of ``view`` by ``g``.
+        """Fork: scale the target-derived columns of ``view`` by ``g``.
 
         Built as a multiplicative MASK over the full width rather than a
         scatter of slices: the confidence columns live INSIDE the belief-mode
@@ -290,7 +291,7 @@ class RecurrentActor(nn.Module):
             policy_hidden_state, policy_rnn_input
         )
         if self.aux_predict:
-            # §53 aux head reads the CORE output (pre post-torso) so the
+            # The aux head reads the CORE output (pre post-torso) so the
             # gradient shapes the recurrent representation itself.
             aux = nn.Dense(2, name="aux_evader_head")(policy_embedding)
             self.sow("intermediates", "aux_evader_pred", aux)

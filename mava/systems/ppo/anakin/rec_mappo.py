@@ -57,25 +57,25 @@ from mava.wrappers.episode_metrics import get_final_step_metrics
 
 
 def _adaptive_ent_coef(base: float, entropy: chex.Array, target: Any, gain: float) -> chex.Array:
-    """Fork §60/§64e: SIGNED target-entropy control for the entropy bonus.
+    """Fork: SIGNED target-entropy control for the entropy bonus.
 
     Fixed coefficients are bistable on wide policies and runaway-prone in
-    flat-advantage regimes (§64d: long search phases let even a floored
+    flat-advantage regimes (long search phases let even a floored
     bonus drift entropy to ~1.4 and dissolve the policy). Below ``target``
-    the bonus is boosted exponentially (the proven §60 half); ABOVE target
+    the bonus is boosted exponentially; ABOVE target
     the coefficient goes NEGATIVE — an active entropy penalty proportional
     to the excess — because zeroing the bonus alone has no authority when
     the surrogate itself is flat. Stateless — a pure function of the
     current batch — so checkpoints, warm-starts, and the learner-state
     pytree are unaffected. ``target=None`` reduces to the constant
-    ``base``. (§60b's gen3w-ext ran the unsigned v1 semantics: floor 0.05
-    instead of the negative branch.)
+    ``base``. (An earlier form ran unsigned: a 0.05 floor instead of the
+    negative branch.)
     """
     if target is None:
         return jnp.asarray(base)
     h = jax.lax.stop_gradient(entropy)
     # Continuous at the target (both branches equal ``base`` there): below,
-    # the §60 exponential boost; above, a linear descent through zero into
+    # the exponential boost; above, a linear descent through zero into
     # the penalty region, crossing at h = target + 1/gain.
     boost = base * jnp.clip(jnp.exp(gain * (target - h)), 1.0, 20.0)
     penalty = base * jnp.clip(1.0 - gain * (h - target), -20.0, 1.0)
@@ -83,7 +83,7 @@ def _adaptive_ent_coef(base: float, entropy: chex.Array, target: Any, gain: floa
 
 
 def _masked_normalise(x: chex.Array, w: Any = None) -> chex.Array:
-    """Fork §131d: standardise ``x`` using only the rows ``w`` selects.
+    """Fork: standardise ``x`` using only the rows ``w`` selects.
 
     PPO normalises the advantage at minibatch level, and with ``learn_mask``
     on that scaling was computed over EVERY row and only then were the masked
@@ -124,7 +124,7 @@ def _masked_normalise(x: chex.Array, w: Any = None) -> chex.Array:
 def _find_sown(d: Any, key: str) -> Any:
     """First ``key`` sown anywhere in an "intermediates" tree, or None.
 
-    Fork §134: a sow made inside a SUBMODULE is nested one level down by
+    Fork: a sow made inside a SUBMODULE is nested one level down by
     flax and a top-level lookup raises KeyError. Find it wherever it is
     rather than hard-coding either shape.
     """
@@ -149,13 +149,13 @@ def get_learner_fn(
     actor_apply_fn, critic_apply_fn = apply_fns
     actor_update_fn, critic_update_fn = update_fns
 
-    # Fork (pursuit DESIGN §148s / WP9). ``BatchAutoResetWrapper`` steps a whole
+    # Fork (pursuit). ``BatchAutoResetWrapper`` steps a whole
     # batch of envs itself so that the auto-reset can hide behind one
     # ``lax.cond(jnp.any(done), ...)``; when it is in the stack we must NOT vmap
     # ``env.step`` here, and the whole update step must NOT be vmapped either
     # (a cond under vmap is a select — both branches run — and its batching rule
-    # broadcasts branch closure constants, which tiled the BFS table x num_envs
-    # in §30). ``update_batch_size == 1`` in every recipe in this repo, so we
+    # broadcasts branch closure constants, which once tiled the BFS table x
+    # num_envs). ``update_batch_size == 1`` in every recipe in this repo, so we
     # simply call ``_update_step`` directly and keep the vmap for the > 1 case.
     batched_env = bool(getattr(env, "batched_step", False))
     use_batch_axis = config.system.update_batch_size > 1
@@ -164,7 +164,7 @@ def get_learner_fn(
             "system.update_batch_size > 1 cannot be combined with a batched "
             "auto-reset env: vmapping the update step would put the wrapper's "
             "lax.cond under a vmap, which turns it back into a select AND "
-            "broadcasts its closure constants (DESIGN §30). Set "
+            "broadcasts its closure constants. Set "
             "system.batch_auto_reset=False or system.update_batch_size=1."
         )
 
@@ -234,13 +234,13 @@ def get_learner_fn(
             action, log_prob, value = action.squeeze(0), log_prob.squeeze(0), value.squeeze(0)
 
             # Step the environment. A ``BatchAutoResetWrapper`` env steps the
-            # whole batch itself (fork §148s / WP9); everything else is per-env.
+            # whole batch itself (fork); everything else is per-env.
             if batched_env:
                 env_state, timestep = env.step(env_state, action)
             else:
                 env_state, timestep = jax.vmap(env.step, in_axes=(0, 0))(env_state, action)
 
-            # Fork §148s: the fraction of rollout steps on which ANY env was
+            # Fork: the fraction of rollout steps on which ANY env was
             # done — i.e. the fraction that actually paid for a reset. This is
             # exactly the batch wrapper's cond predicate, so logging its mean
             # per update is what explains the speed-up (and what would show a
@@ -285,7 +285,7 @@ def get_learner_fn(
                 log_prob,
                 last_timestep.observation,
                 last_hstates,
-                # Fork §131d: absent unless the env opts in, in which case the
+                # Fork: absent unless the env opts in, in which case the
                 # field stays None and everything below is an exact no-op.
                 last_timestep.extras.get("learn_mask"),
             )
@@ -346,7 +346,7 @@ def get_learner_fn(
                     # Rerun network
                     obs_and_done = (traj_batch.obs, traj_batch.done)
                     aux_coef = config.system.get("aux_predict_coef", 0.0)
-                    # Fork §148y: the learned target gate sows too, and its
+                    # Fork: the learned target gate sows too, and its
                     # telemetry must not depend on a loss coefficient either.
                     _tcfg = config.network.get("target_gate", None)
                     tgate_on = _tcfg is not None and _tcfg.get("enabled", False)
@@ -373,7 +373,7 @@ def get_learner_fn(
                     # Calculate actor loss
                     ratio = jnp.exp(log_prob - traj_batch.log_prob)
                     # Nomalise advantage at minibatch level — over the rows the
-                    # mask keeps, not over all of them (fork §131d; see
+                    # mask keeps, not over all of them (fork; see
                     # ``_masked_normalise`` for why the difference matters).
                     lm = traj_batch.learn_mask
                     gae = _masked_normalise(gae, lm)
@@ -388,7 +388,7 @@ def get_learner_fn(
                     )
                     actor_loss = -jnp.minimum(actor_loss1, actor_loss2)
                     ent_per_agent = actor_policy.entropy(seed=key)
-                    # Fork §131d: exclude a COMPROMISED agent's transitions from
+                    # Fork: exclude a COMPROMISED agent's transitions from
                     # the policy objective. It runs the shared policy on a
                     # deliberately falsified input, so its rows teach the policy
                     # how to act while believing a phantom — and let it discover
@@ -415,7 +415,7 @@ def get_learner_fn(
                     total_loss = actor_loss - ent_coef * entropy
                     aux_mse = jnp.float32(0.0)
                     if aux_coef:
-                        # Fork §53: supervised aux loss — predict the TRUE
+                        # Fork: supervised aux loss — predict the TRUE
                         # evader position (global_state[..., 0:2], hindsight)
                         # ``k`` steps ahead. Valid where no episode boundary
                         # sits in (t, t+k]: done-count difference via cumsum.
@@ -429,7 +429,7 @@ def get_learner_fn(
                         aux_mse = jnp.sum(se * valid) / (jnp.sum(valid) + 1e-8)
                         total_loss = total_loss + aux_coef * aux_mse
 
-                    # Fork §148y: the learned target gate's telemetry — what
+                    # Fork: the learned target gate's telemetry — what
                     # fraction of the belief target the policy is actually
                     # letting through, and where its threshold and sharpness
                     # have moved to. All three read 0.0 without the gate.
@@ -486,7 +486,7 @@ def get_learner_fn(
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
                         value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
 
-                    # §117 (D2) instrumentation. Two statistics that decide
+                    # Fork instrumentation. Two statistics that decide
                     # whether the Huber/clipping regime is actually costing us,
                     # and that a checkpoint replay CANNOT produce — clipping
                     # compares the freshly-updated value against the stored old
@@ -573,16 +573,16 @@ def get_learner_fn(
                     "value_loss": unscaled_value_loss,
                     "actor_loss": actor_loss,
                     "entropy": entropy,
-                    # Fork §53: 0.0 unless system.aux_predict_coef is set.
+                    # Fork: 0.0 unless system.aux_predict_coef is set.
                     "aux_predict_loss": aux_mse,
-                    # Fork §117 (D2): the value-target regime. huber_frac is the
+                    # Fork: the value-target regime. huber_frac is the
                     # fraction of residuals in Huber's linear region (bounded
                     # gradients, median-seeking); clip_frac is the fraction
                     # taking the CLIPPED branch (a large correction suppressed).
                     # Both are training-time only — a replay cannot see them.
                     "huber_frac": huber_frac,
                     "clip_frac": clip_frac,
-                    # Fork §148y: the LEARNED entropy gate on the belief
+                    # Fork: the LEARNED entropy gate on the belief
                     # target. `target_gate_mean` is how much of the target the
                     # policy lets through on average; `_h0` and `_k` are the
                     # threshold and the sharpness it has trained them to, which
@@ -653,7 +653,7 @@ def get_learner_fn(
         )
 
         params, opt_states, traj_batch, advantages, targets, key = update_state
-        # Fork §148s: broadcast to the loss_info leaf shape (ppo_epochs,
+        # Fork: broadcast to the loss_info leaf shape (ppo_epochs,
         # num_minibatches) so the logger's mean over train metrics is the
         # rollout's reset-branch fraction.
         loss_info["reset_branch_frac"] = jnp.full_like(
@@ -692,7 +692,7 @@ def get_learner_fn(
         if use_batch_axis:
             batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
         else:
-            # Fork §148s / WP9: with update_batch_size == 1 the vmap exists only
+            # Fork: with update_batch_size == 1 the vmap exists only
             # to carry a size-1 axis, and it is precisely what would turn
             # ``BatchAutoResetWrapper``'s ``lax.cond`` back into a select. Drop
             # it and move the leading axis by hand; ``_pmean_batch`` already
@@ -747,7 +747,7 @@ def learner_setup(
     critic_pre_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
     critic_post_torso = hydra.utils.instantiate(config.network.critic_network.post_torso)
 
-    # Fork §148y: the LEARNED target gate. The slices come from the env's own
+    # Fork: the LEARNED target gate. The slices come from the env's own
     # layout table, so a block added to `agents_view` cannot silently slide
     # the gated columns.
     tgate_cfg = config.network.get("target_gate", None)
@@ -773,11 +773,11 @@ def learner_setup(
         post_torso=actor_post_torso,
         action_head=actor_action_head,
         hidden_state_dim=config.network.hidden_state_dim,
-        # Fork §51: optional temporal-core swap (default "gru" = stock).
+        # Fork: optional temporal-core swap (default "gru" = stock).
         temporal_core=config.network.get("temporal_core", "gru"),
-        # Fork §53: aux evader-prediction head, on iff the loss uses it.
+        # Fork: aux evader-prediction head, on iff the loss uses it.
         aux_predict=bool(config.system.get("aux_predict_coef", 0.0)),
-        # Fork §148y: absent (no params, bit-identical tree) unless enabled.
+        # Fork: absent (no params, bit-identical tree) unless enabled.
         target_gate=bool(tgate_on),
         target_slices=tgate_targets,
         conf_slices=tgate_conf,
@@ -829,7 +829,7 @@ def learner_setup(
     critic_params = critic_network.init(critic_net_key, init_critic_hstate, init_obs_done)
     critic_opt_state = critic_optim.init(critic_params)
 
-    # Fork §138/WP3: the REALISED parameter counts, logged once. The
+    # Fork: the REALISED parameter counts, logged once. The
     # "matched by parameter count" controls (ARM_*_BLACKBOX) are only matched
     # if someone checks, and until now nothing printed the number they are
     # supposed to match — the count went into result rows by hand, from the
@@ -890,7 +890,7 @@ def learner_setup(
     key, *env_keys = jax.random.split(
         key, n_devices * config.system.update_batch_size * config.arch.num_envs + 1
     )
-    # Fork §148s / WP9: a ``BatchAutoResetWrapper`` env resets a batch of keys
+    # Fork: a ``BatchAutoResetWrapper`` env resets a batch of keys
     # itself; everything else is per-env and gets the vmap as before.
     if getattr(env, "batched_step", False):
         env_states, timesteps = env.reset(jnp.stack(env_keys))

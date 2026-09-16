@@ -99,7 +99,7 @@ class RNNPPOTransition(NamedTuple):
     log_prob: chex.Array
     obs: chex.Array
     hstates: HiddenStates
-    # Fork (trust-aware-drone-pursuit-evasion §131d): per-agent mask marking
+    # Fork (trust-aware-drone-pursuit-evasion): per-agent mask marking
     # whose transitions the POLICY loss may train on. The env supplies it as
     # ``extras["learn_mask"]`` when a compromised agent is present: that agent
     # runs the shared policy on a deliberately falsified input, so training on

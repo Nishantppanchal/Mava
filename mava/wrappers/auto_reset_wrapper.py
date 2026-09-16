@@ -43,7 +43,7 @@ class AutoResetWrapper(Wrapper):
     # This init isn't really needed as jumanji.Wrapper will forward the attributes,
     # but mypy doesn't realize this.
     def __init__(self, env: MarlEnv, defer_reset: bool = False):
-        """Fork (pursuit DESIGN §148s / WP9): ``defer_reset`` splits ``step``.
+        """Fork (pursuit): ``defer_reset`` splits ``step``.
 
         With ``defer_reset=False`` — the default, and the stock behaviour —
         ``step`` is exactly what it always was: env step, latch
@@ -115,15 +115,15 @@ class AutoResetWrapper(Wrapper):
         large lookup table that broadcast is catastrophic: the pursuit env's
         compact BFS table (1.07 GiB at G=200) was tiled x num_envs into a
         136.56 GiB ``u16[128,571975056]`` buffer inside the rollout while-loop.
-        The select form keeps constants unbatched. See the pursuit repo's
-        DESIGN.md §30.
+        The select form keeps constants unbatched — a ``cond`` under a
+        ``vmap`` would broadcast them instead.
         """
         state, timestep = self._env.step(state, action)
 
         # Both paths of the old cond stored the pre-reset observation in extras.
         state, timestep = self._obs_in_extras(state, timestep)
 
-        # Fork (§148s / WP9): with ``defer_reset`` the tail below is run later,
+        # Fork: with ``defer_reset`` the tail below is run later,
         # once per BATCH, by ``BatchAutoResetWrapper``.
         if self.defer_reset:
             return state, timestep
@@ -160,9 +160,9 @@ class AutoResetWrapper(Wrapper):
 class BatchAutoResetWrapper(Wrapper):
     """Batch-level conditional auto-reset — the OUTERMOST wrapper of the train stack.
 
-    Fork-only (pursuit DESIGN §148s / WP9). ``AutoResetWrapper`` pays a full
+    Fork-only (pursuit). ``AutoResetWrapper`` pays a full
     ``env.reset`` on every env on every step so that a per-leaf ``where`` can
-    select it; §148n measured that at 40 % of the belief arm's step cost while
+    select it; that measured 40 % of the belief arm's step cost while
     being needed on well under 1 % of env-steps (episodes ~800 steps). This
     wrapper takes BATCHED state/action, does the per-env work under one
     ``jax.vmap``, and then runs the deferred reset tail of the inner
@@ -185,7 +185,7 @@ class BatchAutoResetWrapper(Wrapper):
     shows a last-ULP difference under this wrapper, that is the shape of it: fix
     the source expression, don't loosen the test.
 
-    THE CONSTRAINT (DESIGN §30, and the note on ``AutoResetWrapper.step``): the
+    THE CONSTRAINT (see the note on ``AutoResetWrapper.step``): the
     predicate must be a TRUE SCALAR. Under ``jax.vmap`` a ``cond`` becomes a
     ``select`` — both branches run, nothing is saved — and, worse, JAX's cond
     batching rule broadcasts branch closure constants into batched operands,

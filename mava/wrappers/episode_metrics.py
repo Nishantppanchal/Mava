@@ -118,7 +118,7 @@ class RecordEpisodeMetrics(Wrapper):
     ) -> Tuple[RecordEpisodeMetricsState, TimeStep]:
         """Thread ``AutoResetWrapper``'s deferred reset tail through this state.
 
-        Fork (pursuit DESIGN §148s / WP9). ``BatchAutoResetWrapper`` runs the
+        Fork (pursuit). ``BatchAutoResetWrapper`` runs the
         inner ``AutoResetWrapper``'s reset tail once per BATCH, after this
         wrapper has already stepped. That reordering is exact: the tail touches
         only ``state.env_state`` and ``timestep.observation``, while ``step``
