@@ -22,13 +22,12 @@ import jax
 import jax.numpy as jnp
 import optax
 from colorama import Fore, Style
-import flax
 from flax.core.frozen_dict import FrozenDict
 from jax import tree
 from omegaconf import DictConfig, OmegaConf
 
 from mava.evaluator import get_eval_fn, get_num_eval_envs, make_rec_eval_act_fn
-from mava.networks import GatedResidualActor, RecurrentActor as Actor
+from mava.networks import RecurrentActor as Actor
 from mava.networks import RecurrentValueNet as Critic
 from mava.networks import ScannedRNN
 from mava.systems.ppo.types import (
@@ -122,49 +121,12 @@ def _masked_normalise(x: chex.Array, w: Any = None) -> chex.Array:
     return jnp.where(w > 0, (x - mean) / (jnp.sqrt(var) + 1e-8), 0.0)
 
 
-def masked_policy_kl(
-    new_logits: chex.Array,
-    ref_logits: chex.Array,
-    action_mask: chex.Array,
-    weights: Any = None,
-) -> chex.Array:
-    """Fork §138/WP3: ``KL(pi_new || pi_ref)`` averaged over the rows ``weights``
-    selects.
-
-    This is the honest-cost BUDGET. §134f bought "an honest team pays exactly
-    nothing" with an architecture that could only act after the symbolic filter
-    had already convicted someone, which capped what it could ever be worth.
-    §138 replaces the guarantee with a measured bound: the residual is free to
-    move the policy, and this term prices every bit of movement on an episode
-    with no liar in it. ``weights`` is the honest-episode mask, so attacked
-    steps contribute nothing — the defence is *supposed* to deviate there.
-
-    ``ref_logits`` come from the frozen champion and are already
-    ``stop_gradient``-ed inside ``GatedResidualActor``, so the gradient of this
-    term reaches the residual and the gate and nothing else.
-
-    Illegal actions carry ``finfo.min`` in BOTH argument sets. After
-    ``log_softmax`` their difference is ``-inf - -inf = NaN``, which would
-    poison the whole update, so the per-action term is masked to zero rather
-    than relying on the (vanishing) probability weight to do it.
-    """
-    log_p = jax.nn.log_softmax(new_logits, axis=-1)
-    log_q = jax.nn.log_softmax(ref_logits, axis=-1)
-    diff = jnp.where(action_mask, log_p - log_q, 0.0)
-    p = jnp.where(action_mask, jnp.exp(log_p), 0.0)
-    kl = jnp.sum(p * diff, axis=-1)
-    if weights is None:
-        return kl.mean()
-    w = weights.astype(kl.dtype)
-    return jnp.sum(jnp.where(w > 0, kl, 0.0) * w) / (jnp.sum(w) + 1e-8)
-
-
 def _find_sown(d: Any, key: str) -> Any:
     """First ``key`` sown anywhere in an "intermediates" tree, or None.
 
-    Fork §134: under ``GatedResidualActor`` the champion is a SUBMODULE, so
-    flax nests its sows one level down and a top-level lookup raises KeyError.
-    Find it wherever it is rather than hard-coding either shape.
+    Fork §134: a sow made inside a SUBMODULE is nested one level down by
+    flax and a top-level lookup raises KeyError. Find it wherever it is
+    rather than hard-coding either shape.
     """
     if not isinstance(d, dict):
         return None
@@ -326,9 +288,6 @@ def get_learner_fn(
                 # Fork §131d: absent unless the env opts in, in which case the
                 # field stays None and everything below is an exact no-op.
                 last_timestep.extras.get("learn_mask"),
-                # Fork §138/WP3: the honest-episode budget's mask. Same source
-                # (env.kwargs.learn_mask), same None-is-a-no-op contract.
-                last_timestep.extras.get("honest_mask"),
             )
             learner_state = RNNLearnerState(
                 params, opt_states, key, env_state, timestep, done, hstates
@@ -387,27 +346,13 @@ def get_learner_fn(
                     # Rerun network
                     obs_and_done = (traj_batch.obs, traj_batch.done)
                     aux_coef = config.system.get("aux_predict_coef", 0.0)
-                    # Fork §138/WP3: the honest-episode KL budget needs the
-                    # champion's logits, which GatedResidualActor sows, so it
-                    # opts into the same mutable collection the §53 aux head
-                    # uses. Both off = the stock single-return path, unchanged.
-                    kl_coef = config.system.get("honest_kl_coef", 0.0)
-                    # Fork §147c: the gate and |delta| telemetry must not
-                    # depend on a LOSS coefficient. §146f's partition sets
-                    # honest_kl_coef=0, and with the aux head also off the
-                    # sows were never read, so the run that most needed to say
-                    # whether delta had grown logged three zeros. A residual
-                    # run always takes the mutable path now; the forward pass
-                    # is the same computation either way.
-                    _rcfg = config.network.get("residual", None)
-                    residual_on = _rcfg is not None and _rcfg.get("enabled", False)
                     # Fork §148y: the learned target gate sows too, and its
                     # telemetry must not depend on a loss coefficient either.
                     _tcfg = config.network.get("target_gate", None)
                     tgate_on = _tcfg is not None and _tcfg.get("enabled", False)
-                    aux_pred = champion_logits = gate = delta = None
+                    aux_pred = None
                     tgate = tgate_h0 = tgate_k = None
-                    if aux_coef or kl_coef or residual_on or tgate_on:
+                    if aux_coef or tgate_on:
                         ((_, actor_policy), inters) = actor_apply_fn(
                             actor_params,
                             traj_batch.hstates.policy_hidden_state[0],
@@ -416,9 +361,6 @@ def get_learner_fn(
                         )
                         sown = inters["intermediates"]
                         aux_pred = _find_sown(sown, "aux_evader_pred")
-                        champion_logits = _find_sown(sown, "champion_logits")
-                        gate = _find_sown(sown, "gate")
-                        delta = _find_sown(sown, "delta")
                         tgate = _find_sown(sown, "target_gate")
                         tgate_h0 = _find_sown(sown, "tgate_h0")
                         tgate_k = _find_sown(sown, "tgate_k")
@@ -487,36 +429,6 @@ def get_learner_fn(
                         aux_mse = jnp.sum(se * valid) / (jnp.sum(valid) + 1e-8)
                         total_loss = total_loss + aux_coef * aux_mse
 
-                    # Fork §138/WP3: the honest-episode KL budget, and the two
-                    # gate statistics that say whether the residual is opening
-                    # where it is supposed to. All exactly 0.0 unless a
-                    # GatedResidualActor sowed and the coefficient is set, so
-                    # every existing run's loss_info keys gain three zeros and
-                    # nothing else.
-                    honest_kl = jnp.float32(0.0)
-                    gate_mean_honest = jnp.float32(0.0)
-                    gate_mean_attacked = jnp.float32(0.0)
-                    # Fork §147c: mean |delta| over the batch — the residual's
-                    # CONTENT, separately from the authority the gate grants
-                    # it. Zero here says the head never left its zero init;
-                    # large here with the policy unmoved says the displacement
-                    # exists and the merge cannot spend it, which is exactly
-                    # the distinction §146f could not make. Defined for every
-                    # gate kind (it is the effective displacement: post-clip
-                    # under `soft`, the raw head under `hard` and `mix`).
-                    delta_abs_mean = jnp.float32(0.0)
-                    hm = traj_batch.honest_mask
-                    if delta is not None:
-                        delta_abs_mean = jnp.abs(delta).mean()
-                    if gate is not None:
-                        g = gate[..., 0]
-                        if hm is None:
-                            gate_mean_honest = g.mean()
-                        else:
-                            hw = hm.astype(g.dtype)
-                            gate_mean_honest = jnp.sum(g * hw) / (jnp.sum(hw) + 1e-8)
-                            aw = 1.0 - hw
-                            gate_mean_attacked = jnp.sum(g * aw) / (jnp.sum(aw) + 1e-8)
                     # Fork §148y: the learned target gate's telemetry — what
                     # fraction of the belief target the policy is actually
                     # letting through, and where its threshold and sharpness
@@ -528,22 +440,10 @@ def get_learner_fn(
                         target_gate_mean = jnp.mean(tgate)
                         target_gate_h0 = jnp.reshape(tgate_h0, ())
                         target_gate_k = jnp.reshape(tgate_k, ())
-                    if kl_coef and champion_logits is not None:
-                        honest_kl = masked_policy_kl(
-                            actor_policy.distribution.logits,
-                            champion_logits,
-                            traj_batch.obs.action_mask,
-                            hm,
-                        )
-                        total_loss = total_loss + kl_coef * honest_kl
                     return total_loss, (
                         actor_loss,
                         entropy,
                         aux_mse,
-                        honest_kl,
-                        gate_mean_honest,
-                        gate_mean_attacked,
-                        delta_abs_mean,
                         target_gate_mean,
                         target_gate_h0,
                         target_gate_k,
@@ -659,10 +559,6 @@ def get_learner_fn(
                     _,
                     entropy,
                     aux_mse,
-                    honest_kl,
-                    gate_mean_honest,
-                    gate_mean_attacked,
-                    delta_abs_mean,
                     target_gate_mean,
                     target_gate_h0,
                     target_gate_k,
@@ -686,19 +582,6 @@ def get_learner_fn(
                     # Both are training-time only — a replay cannot see them.
                     "huber_frac": huber_frac,
                     "clip_frac": clip_frac,
-                    # Fork §138/WP3: the honest-cost budget and where the
-                    # residual's gate actually opens. `honest_kl` is the
-                    # measured price of the defence on liar-free episodes —
-                    # the number that replaces §134f's bit-identity claim —
-                    # and the two gate means say whether it is opening on the
-                    # episodes that warrant it. 0.0 on every run without a
-                    # soft-gated residual.
-                    "honest_kl": honest_kl,
-                    "gate_mean_honest": gate_mean_honest,
-                    "gate_mean_attacked": gate_mean_attacked,
-                    # Fork §147c: mean |delta|, the residual's content. Reads
-                    # 0.0 on every run without a residual.
-                    "delta_abs_mean": delta_abs_mean,
                     # Fork §148y: the LEARNED entropy gate on the belief
                     # target. `target_gate_mean` is how much of the target the
                     # policy lets through on average; `_h0` and `_k` are the
@@ -864,15 +747,9 @@ def learner_setup(
     critic_pre_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
     critic_post_torso = hydra.utils.instantiate(config.network.critic_network.post_torso)
 
-    residual_cfg = config.network.get("residual", None)
-    residual_on = residual_cfg is not None and residual_cfg.get("enabled", False)
-    # Fork §138/WP3: the residual conditions on the champion's post-GRU core,
-    # so the champion has to hand it back. Params are identical either way.
-    residual_full_view = residual_on and bool(residual_cfg.get("full_view", False))
-
     # Fork §148y: the LEARNED target gate. The slices come from the env's own
-    # layout table (the same mechanism as the residual's tail window below), so
-    # a block added to `agents_view` cannot silently slide the gated columns.
+    # layout table, so a block added to `agents_view` cannot silently slide
+    # the gated columns.
     tgate_cfg = config.network.get("target_gate", None)
     tgate_on = tgate_cfg is not None and tgate_cfg.get("enabled", False)
     tgate_targets: Tuple[Tuple[int, int], ...] = ()
@@ -900,7 +777,6 @@ def learner_setup(
         temporal_core=config.network.get("temporal_core", "gru"),
         # Fork §53: aux evader-prediction head, on iff the loss uses it.
         aux_predict=bool(config.system.get("aux_predict_coef", 0.0)),
-        return_core=residual_full_view,
         # Fork §148y: absent (no params, bit-identical tree) unless enabled.
         target_gate=bool(tgate_on),
         target_slices=tgate_targets,
@@ -910,37 +786,6 @@ def learner_setup(
         ),
         gate_init_slope=float(tgate_cfg.get("init_slope", 200.0) if tgate_on else 200.0),
     )
-    # Fork §134 Layer 3: wrap the champion in a gated residual. The residual
-    # is the only trainable part and it is multiplied by a hard 0/1 alarm the
-    # environment sets, so on a team with no liars it contributes exactly zero
-    # and the fine-tuned policy is bit-identical to the checkpoint it started
-    # from. See GatedResidualActor.
-    if residual_on:
-        tail_start, tail_width = env.unwrapped.actor_tail_slice
-        if tail_width <= 0:
-            raise ValueError(
-                "network.residual.enabled needs the env's trust tail: set "
-                "env.kwargs.trust_tail=True beside a belief block (belief_obs > 0 "
-                "or dbn_obs > 0). NOT trust_obs — it widens the actor too "
-                "and is refused here; use trust_obs_critic (§146g)"
-            )
-        config.system.tail_start = int(tail_start)
-        config.system.tail_width = int(tail_width)
-        actor_network = GatedResidualActor(
-            champion=actor_network,
-            residual_torso=hydra.utils.instantiate(residual_cfg.torso),
-            action_dim=env.action_dim,
-            tail_start=int(tail_start),
-            tail_width=int(tail_width),
-            hidden_state_dim=config.network.hidden_state_dim,
-            freeze_champion=bool(residual_cfg.get("freeze_champion", True)),
-            # Fork §138/WP3. "hard" is §134f verbatim and stays the default.
-            gate=str(residual_cfg.get("gate", "hard")),
-            gate_bias0=float(residual_cfg.get("gate_bias0", -4.0)),
-            delta_clip=float(residual_cfg.get("delta_clip", 5.0)),
-            full_view=residual_full_view,
-        )
-
     critic_network = Critic(
         pre_torso=critic_pre_torso,
         post_torso=critic_post_torso,
@@ -955,28 +800,6 @@ def learner_setup(
         optax.clip_by_global_norm(config.system.max_grad_norm),
         optax.adam(actor_lr, eps=1e-5),
     )
-    if residual_on and residual_cfg.get("freeze_champion", True):
-        # Belt and braces. stop_gradient already zeroes the champion's
-        # gradients, but a zero gradient still moves an Adam state, and a
-        # future edit that removed the stop_gradient would silently start
-        # training the champion. Partitioning says the intent in one place the
-        # test can assert on.
-        def _label(path, _leaf):
-            return "freeze" if any("champion" in str(k) for k in path) else "train"
-
-        # Zero the champion's gradients FIRST, then clip. The other order
-        # would let the frozen half contribute to the global norm — and it
-        # does contribute: the §53 aux head lives inside the champion and
-        # produces a real gradient — which would silently shrink the
-        # residual's effective step by a factor nobody chose.
-        actor_optim = optax.chain(
-            optax.multi_transform(
-                {"train": optax.identity(), "freeze": optax.set_to_zero()},
-                lambda params: flax.traverse_util.path_aware_map(_label, params),
-            ),
-            optax.clip_by_global_norm(config.system.max_grad_norm),
-            optax.adam(actor_lr, eps=1e-5),
-        )
     critic_optim = optax.chain(
         optax.clip_by_global_norm(config.system.max_grad_norm),
         optax.adam(critic_lr, eps=1e-5),
@@ -1056,44 +879,6 @@ def learner_setup(
         # differ (e.g. warm-starting a 128-env checkpoint at 256 envs), keep
         # the freshly initialised hstates instead — they are transient
         # per-episode context, not learned state.
-        # Fork §134: a champion checkpoint has no "champion" subtree, so graft
-        # it into one. This is what lets the residual arm warm-start from the
-        # existing T2 ladder instead of needing a fresh one.
-        if residual_on and "champion" not in restored_params.actor_params["params"]:
-            grafted = flax.core.unfreeze(actor_params)
-            grafted["params"]["champion"] = flax.core.unfreeze(
-                restored_params.actor_params
-            )["params"]
-            restored_params = restored_params._replace(actor_params=grafted)
-        # Fork §146g: the champion's CRITIC may not fit this run's critic.
-        # ``trust_obs=True`` widens ``global_state`` by 2N (the credibility row
-        # plus the ground-truth liar mask), which the residual arms need and
-        # the champion was not trained with. ``restore_params`` reads the
-        # checkpoint's own structure — it never consults ``input_params`` for
-        # shapes — so a width change is restored SILENTLY and only dies much
-        # later, inside the pmapped learner's trace, as a dot_general shape
-        # error with no mention of the checkpoint. On the residual path the
-        # champion is what the graft is for; the critic is trained from scratch
-        # at the adapter's budget anyway, so keep the freshly initialised one
-        # (its optimiser state is already the fresh one) and say so.
-        if residual_on:
-            flat = flax.traverse_util.flatten_dict
-            fresh_c = {k: jnp.shape(v) for k, v in flat(critic_params).items()}
-            rest_c = {
-                k: jnp.shape(v) for k, v in flat(restored_params.critic_params).items()
-            }
-            moved = sorted(k for k in fresh_c if fresh_c[k] != rest_c.get(k))
-            if moved or set(rest_c) - set(fresh_c):
-                k0 = moved[0] if moved else sorted(set(rest_c) - set(fresh_c))[0]
-                was, now = rest_c.get(k0), fresh_c.get(k0)
-                print(
-                    f"{Fore.YELLOW}{Style.BRIGHT}Critic re-initialised: "
-                    f"width {was} -> {now} at {'/'.join(map(str, k0))} "
-                    "(e.g. env.kwargs.trust_obs) — the checkpoint's critic does "
-                    f"not fit this run; restoring the champion actor only."
-                    f"{Style.RESET_ALL}"
-                )
-                restored_params = restored_params._replace(critic_params=critic_params)
         params = restored_params
         if restored_hstates is not None:
             fresh_shapes = jax.tree_util.tree_map(lambda x: x.shape, hstates)

@@ -23,7 +23,7 @@ import tensorflow_probability.substrates.jax.distributions as tfd
 from flax import linen as nn
 from flax.linen.initializers import orthogonal
 
-from mava.networks.distributions import IdentityTransformation, MaskedEpsGreedyDistribution
+from mava.networks.distributions import MaskedEpsGreedyDistribution
 from mava.networks.torsos import MLPTorso
 from mava.types import (
     GraphObservation,
@@ -153,11 +153,10 @@ class ScannedRNN(nn.Module):
 class RecurrentActor(nn.Module):
     """Recurrent Actor Network.
 
-    Fork §51/§97: ``temporal_core`` selects the memory module — "gru"
-    (stock ScannedRNN, default; zero behavior change) or "dual_gru"
-    (ScannedDualGRU, the §80 phase-gated dual-timescale core). The §51/§53
-    window-attention and SSM cores were removed in §97 (both closed
-    negative, DESIGN §80/§82b) — git history has them.
+    Fork §51/§97: ``temporal_core`` selects the memory module. Only "gru"
+    (stock ScannedRNN, the default) remains: the §51/§53 window-attention and
+    SSM cores were removed in §97 and the §80 phase-gated dual-timescale core
+    in WP10 (all three closed negative, DESIGN §80/§82b) — git history has them.
 
     Fork §53: ``aux_predict`` adds an auxiliary evader-position head off the
     temporal core (Dense(2) on the recurrent embedding), exposed ONLY via
@@ -170,11 +169,10 @@ class RecurrentActor(nn.Module):
 
     Fork §138/WP3: ``return_core`` makes ``__call__`` return a THIRD element,
     the post-GRU core embedding (the same tensor the §53 aux head reads, before
-    ``post_torso``). It exists for ``GatedResidualActor``, whose residual has
-    to condition on what the champion's recurrent state already knows — a sow
-    cannot be read back inside the same forward pass, and re-running the
-    champion would double the cost. Params are untouched by the flag, so a
-    checkpoint grafts in either way.
+    ``post_torso``) — the only way to read that tensor inside the forward pass
+    that produced it, since a sow cannot be read back. Its original consumer,
+    the residual adapter, was removed in WP10. Params are untouched by the
+    flag, so a checkpoint grafts in either way.
 
     Fork §148y: ``target_gate`` is the LEARNED, differentiable replacement for
     the environment's hard entropy gate (``env.kwargs.belief_target_entropy_max``,
@@ -213,7 +211,7 @@ class RecurrentActor(nn.Module):
     aux_predict: bool = False
     return_core: bool = False
     # Fork §148y. Slices are (start, width) pairs in the env's own layout,
-    # handed down by learner_setup exactly as GatedResidualActor's tail is.
+    # handed down by learner_setup from that layout table.
     target_gate: bool = False
     target_slices: Tuple[Tuple[int, int], ...] = ()
     conf_slices: Tuple[Tuple[int, int], ...] = ()
@@ -288,15 +286,9 @@ class RecurrentActor(nn.Module):
             action_mask = observation.action_mask
 
         policy_rnn_input = (policy_embedding, done)
-        if self.temporal_core == "dual_gru":
-            # Fork §80: phase-gated dual-timescale GRU (see ScannedDualGRU).
-            policy_hidden_state, policy_embedding = ScannedDualGRU(
-                hidden_state_dim=self.hidden_state_dim
-            )(policy_hidden_state, policy_rnn_input)
-        else:
-            policy_hidden_state, policy_embedding = ScannedRNN(self.hidden_state_dim)(
-                policy_hidden_state, policy_rnn_input
-            )
+        policy_hidden_state, policy_embedding = ScannedRNN(self.hidden_state_dim)(
+            policy_hidden_state, policy_rnn_input
+        )
         if self.aux_predict:
             # §53 aux head reads the CORE output (pre post-torso) so the
             # gradient shapes the recurrent representation itself.
@@ -309,246 +301,6 @@ class RecurrentActor(nn.Module):
         if self.return_core:
             return policy_hidden_state, pi, core_embedding
         return policy_hidden_state, pi
-
-
-def mixture_logits(
-    champion_logits: chex.Array,
-    delta: chex.Array,
-    gate_logit: chex.Array,
-    action_mask: chex.Array,
-) -> chex.Array:
-    """Fork §147c: log-probabilities of ``(1 - g) * pi_champ + g * pi_res``.
-
-    ``pi_res = softmax(z_champ + delta)`` with ``delta`` UNCLIPPED, ``g =
-    sigmoid(gate_logit)``. Returned in LOGIT space (as an additive shift on the
-    champion's own masked logits) rather than as a normalised log-probability,
-    for one reason: at ``delta = 0`` the shift is EXACTLY ``0.0`` and the
-    returned array is bit-identical to ``champion_logits``, so the honest KL is
-    exactly zero at init and a graft's trajectories are the champion's. Adding
-    the shift to ``log_softmax(champion_logits)`` instead would be correct to
-    1e-7 and to nothing better, and §138's budget is a claim about zero.
-
-    With ``u = log pi_res - log pi_champ`` the shift is
-
-        log((1 - g) + g * exp(u))  -  log((1 - g) + g),
-
-    i.e. ``logaddexp(log(1-g), log(g) + u)`` minus the same expression at
-    ``u = 0``. The subtrahend is ``log(1) = 0`` in exact arithmetic and 1e-7 of
-    nothing in float32, so it costs no accuracy — it BUYS the identity: at
-    ``u = 0`` the two ``logaddexp`` calls have bit-identical arguments, so the
-    shift is ``x - x = 0.0`` exactly, and it also makes the gate's gradient
-    exactly zero at init (both terms move together), which is §145's ordering
-    — the head earns content before the gate can grant it authority.
-    ``delta = 0`` makes ``u`` exactly zero because both log-softmaxes then run
-    on bit-identical arrays.
-
-    Every piece is finite for every input. ``log_sigmoid`` never returns
-    ``-inf`` for a finite argument (it degrades to the argument itself), and
-    ``logaddexp`` of two finite numbers is finite with gradients that are
-    mixture responsibilities in [0, 1]. The obvious alternative,
-    ``log1p(g * expm1(u))``, is exact at ``u = 0`` too but hands back a NaN
-    gradient the moment ``g`` saturates to 1.0 and ``expm1(u)`` to -1.0 — both
-    of which are ordinary float32 values, reachable by a trained gate at
-    ``|gate_logit| > 17`` and a residual that wants an action gone.
-
-    Illegal actions carry ``finfo.min`` in both log-softmaxes, so ``u`` is
-    exactly zero there and the shift is zero; they are re-masked on the way out
-    regardless.
-    """
-    neg = jnp.finfo(jnp.float32).min
-    log_pc = jax.nn.log_softmax(champion_logits, axis=-1)
-    log_pr = jax.nn.log_softmax(
-        jnp.where(action_mask, champion_logits + delta, neg), axis=-1
-    )
-    u = log_pr - log_pc
-    log_g = jax.nn.log_sigmoid(gate_logit)
-    log_1mg = jax.nn.log_sigmoid(-gate_logit)
-    shift = jnp.logaddexp(log_1mg, log_g + u) - jnp.logaddexp(log_1mg, log_g)
-    return jnp.where(action_mask, champion_logits + shift, neg)
-
-
-class GatedResidualActor(nn.Module):
-    """Fork §134/§138: a frozen champion plus a gated residual.
-
-        merged = champion(head) + g * clip(delta, -delta_clip, +delta_clip)
-
-    ``gate="hard"`` is §134f, unchanged and still the default: ``g`` is the
-    environment's hard 0/1 alarm column, so on a team with no liars it is
-    exactly 0, the product is exactly 0, and IEEE addition of 0.0 leaves the
-    champion's logits bit-identical. That was a GUARANTEE, and §138 records
-    why it was too strong to keep as the only option: an alarm-gated residual
-    can only act after the symbolic filter has already convicted someone, so
-    its ceiling is the damage that survives detection -- measured at +0.0020
-    [-0.0042, +0.0079], i.e. nothing.
-
-    ``gate="soft"`` replaces the guarantee with a BUDGET. ``g`` is a learned
-    sigmoid, biased at ``gate_bias0`` (default 0.0, half open since §147: a nearly
-    closed gate times a zero-initialised head is a dead start) so the policy
-    starts almost closed, and ``delta`` comes from a zero-initialised head, so
-    at init ``merged`` equals the champion EXACTLY regardless of ``g`` and the
-    first PPO ratio is 1. What keeps the honest cost small afterwards is not
-    the architecture but ``system.honest_kl_coef``, a KL penalty against the
-    champion on honest-episode steps, plus ``delta_clip`` on the logit
-    displacement. "Cannot regress" becomes "regresses by at most epsilon,
-    measured" -- §138's decision, taken with the user.
-
-    ``gate="mix"`` (§147c) changes the ALGEBRA rather than the budget, and it
-    is the answer to §146f. Under both additive gates the residual can move a
-    logit by at most ``g * delta_clip``, so two actions' relative margin moves
-    by at most ``2 * g * delta_clip`` -- 4.8 at the shipped ``g = 0.48`` and
-    ``delta_clip = 5`` against a champion whose top-two margin is 3.5-5.5 at
-    entropy 0.19. Ten million steps of PPO produced a policy that was the
-    champion's on every evaluated row, in every arm. ``mix`` merges in
-    PROBABILITY space instead::
-
-        pi = (1 - g) * pi_champ + g * softmax(z_champ + delta)
-
-    with ``delta`` unclipped (``delta_clip`` is IGNORED under ``mix``; it stays
-    live for the two additive gates). The residual can now take the policy
-    over outright by driving ``g`` to 1, and the honest cost is bounded by ``g``
-    itself rather than by a clip -- a mixture with a champion is never further
-    from it than the mixture weight allows. What is unchanged is the init:
-    ``delta = 0`` makes ``pi_res = pi_champ``, so ``pi = pi_champ`` for ANY
-    ``g``, exactly, and the honest KL starts at 0 whatever the gate bias is.
-    See ``mixture_logits`` for why that identity is exact and not approximate.
-
-    ``full_view`` (§138/WP3) decides what the residual READS. The §134f
-    residual saw only the tail window, which is enough to notice a liar and
-    nothing like enough to do anything about one: a policy that cannot see its
-    own pose, the local map or the per-source reports cannot choose a
-    verification detour or a search pattern. With ``full_view`` it reads the
-    whole ``agents_view`` (head AND tail) concatenated with the champion's
-    post-GRU core embedding (stop-gradiented, so the frozen half stays frozen
-    and the residual inherits the champion's memory for free).
-
-    The champion always sees ``agents_view`` with the trust tail cut out, which
-    is bit-identical to the view it was trained on, so a pre-trust checkpoint
-    grafts in unchanged. The recurrent carry is the champion's, so every
-    evaluator, renderer and probe works untouched.
-
-    Sows ``gate``, ``delta`` and ``champion_logits`` into "intermediates" for
-    the loss (the honest-episode KL needs the reference logits) and for logging.
-    ``delta`` is the EFFECTIVE displacement -- post-clip under ``soft``, the raw
-    head under ``hard`` and ``mix`` -- and the trainer logs ``delta_abs_mean``
-    from it. §146f had to GUESS whether the inert adapter had a delta that grew
-    without flipping an argmax or one that never left zero; that number is now
-    read rather than argued.
-    """
-
-    champion: nn.Module  # a RecurrentActor, frozen
-    residual_torso: nn.Module
-    action_dim: int
-    tail_start: int
-    tail_width: int
-    hidden_state_dim: int = 128
-    freeze_champion: bool = True
-    gate: str = "hard"
-    gate_bias0: float = 0.0
-    delta_clip: float = 5.0
-    full_view: bool = False
-
-    @nn.compact
-    def __call__(
-        self,
-        policy_hidden_state: chex.Array,
-        observation_done: RNNObservation,
-    ) -> Tuple[chex.Array, tfd.Distribution]:
-        if self.gate not in ("hard", "soft", "mix"):
-            raise ValueError(
-                f"residual.gate must be 'hard', 'soft' or 'mix', got {self.gate!r}"
-            )
-        observation, done = observation_done
-        view = observation.agents_view
-        lo, hi = self.tail_start, self.tail_start + self.tail_width
-        head = jnp.concatenate([view[..., :lo], view[..., hi:]], axis=-1)
-        tail = view[..., lo:hi]
-
-        champion_out = self.champion(
-            policy_hidden_state, (observation._replace(agents_view=head), done)
-        )
-        if len(champion_out) == 3:
-            policy_hidden_state, pi, core = champion_out
-        else:
-            policy_hidden_state, pi = champion_out
-            core = None
-        logits = pi.distribution.logits
-        if self.freeze_champion:
-            logits = jax.lax.stop_gradient(logits)
-
-        if self.full_view:
-            if core is None:
-                raise ValueError(
-                    "residual.full_view needs the champion's core embedding: "
-                    "build the champion with RecurrentActor(return_core=True)"
-                )
-            # stop_gradient on BOTH halves of the frozen network's contribution.
-            # Without it the residual's loss would reach back through the GRU
-            # into the champion, and "frozen" would be true of the logits only.
-            residual_in = jnp.concatenate([view, jax.lax.stop_gradient(core)], axis=-1)
-        else:
-            residual_in = tail
-        residual_out = self.residual_torso(residual_in)
-
-        # Zero-init: the residual starts as an exact no-op, so the first PPO
-        # ratio is 1 even on the steps where the gate IS open. A randomly
-        # initialised head would move the policy before it had learned
-        # anything, which is the usual way a "safe" fine-tune destroys a
-        # champion in its first update.
-        r = nn.Dense(
-            self.action_dim,
-            kernel_init=nn.initializers.zeros,
-            bias_init=nn.initializers.zeros,
-            name="residual_head",
-        )(residual_out)
-        alarm = tail[..., -1:]  # the env writes this LAST in the tail block
-        masked_champion = jnp.where(
-            observation.action_mask, logits, jnp.finfo(jnp.float32).min
-        )
-        if self.gate == "hard":
-            g = alarm
-            delta = r
-            merged = jnp.where(
-                observation.action_mask,
-                logits + g * delta,
-                jnp.finfo(jnp.float32).min,
-            )
-        else:
-            # Zero kernel + constant bias: the gate is a pure function of the
-            # bias at init (~2 % open at -4.0) and cannot depend on the input
-            # until it has learned to, so the init identity holds for a reason
-            # independent of the head's zero-init.
-            gate_logit = nn.Dense(
-                1,
-                kernel_init=nn.initializers.zeros,
-                bias_init=nn.initializers.constant(self.gate_bias0),
-                name="residual_gate",
-            )(residual_out)
-            g = nn.sigmoid(gate_logit)
-            if self.gate == "mix":
-                # §147c: no clip. A mixture is bounded by its own weight, so
-                # the clip has nothing left to protect and everything to cost —
-                # it is precisely what stopped the additive residual from ever
-                # overriding a confident champion.
-                delta = r
-                merged = mixture_logits(
-                    masked_champion, delta, gate_logit, observation.action_mask
-                )
-            else:
-                delta = jnp.clip(r, -self.delta_clip, self.delta_clip)
-                merged = jnp.where(
-                    observation.action_mask,
-                    logits + g * delta,
-                    jnp.finfo(jnp.float32).min,
-                )
-        # Read by _actor_loss_fn (the honest-episode KL) and by the loggers.
-        # Sowing is a no-op unless the caller passes mutable=["intermediates"],
-        # so this costs the rollout nothing.
-        self.sow("intermediates", "gate", g)
-        self.sow("intermediates", "delta", delta)
-        self.sow("intermediates", "champion_logits", masked_champion)
-        return policy_hidden_state, IdentityTransformation(
-            distribution=tfd.Categorical(logits=merged)
-        )
 
 
 class RecurrentValueNet(nn.Module):
@@ -708,53 +460,3 @@ class QMixingNetwork(nn.Module):
         q_tot = jnp.reshape(y, (B, T, 1))
 
         return q_tot
-
-
-
-
-class ScannedDualGRU(nn.Module):
-    """Phase-gated dual-timescale GRU — a GRU replacement (fork §80).
-
-    Two half-width GRU cells in ``ScannedRNN``'s exact interface. The FAST
-    core updates every step (reactive chase geometry). The SLOW core's update
-    is per-unit gated by a learned, input-conditioned rate g in (0, 1) — an
-    adaptive-timescale (leaky) recurrence that can hold search-phase memory
-    across hundreds of steps while the fast core churns. The gate reads the
-    observation embedding, which carries the contact-phase signal
-    (fused-sighting validity), so the network can learn to run the slow core
-    open during search and nearly frozen in-chase — the two-phase task
-    anatomy (§71/§74) expressed as architecture. Gate bias -2 initialises
-    slow-core rates near 0.12 (~8-step timescale), learnable per unit.
-
-    Carry = concat(h_fast, h_slow), width == ``hidden_state_dim``, zeros ==
-    empty memory — every ``initialize_carry`` site and done-reset works
-    unchanged; output width matches the GRU convention so post-torsos and
-    hstate plumbing are untouched.
-    """
-
-    hidden_state_dim: int = 128
-
-    @functools.partial(
-        nn.scan,
-        variable_broadcast="params",
-        in_axes=0,
-        out_axes=0,
-        split_rngs={"params": False},
-    )
-    @nn.compact
-    def __call__(self, carry: chex.Array, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
-        ins, resets = x
-        carry = jnp.where(resets[:, :, jnp.newaxis], jnp.zeros_like(carry), carry)
-        s = self.hidden_state_dim
-        assert s % 2 == 0, f"dual_gru needs an even hidden_state_dim, got {s}"
-        assert carry.shape[-1] == s, (
-            f"ScannedDualGRU carry width {carry.shape[-1]} != hidden_state_dim {s}"
-        )
-        half = s // 2
-        h_fast, h_slow = carry[..., :half], carry[..., half:]
-        new_fast, _ = nn.GRUCell(features=half, name="fast")(h_fast, ins)
-        cand_slow, _ = nn.GRUCell(features=half, name="slow")(h_slow, ins)
-        g = jax.nn.sigmoid(nn.Dense(half, name="rate_gate")(ins) - 2.0)
-        new_slow = (1.0 - g) * h_slow + g * cand_slow
-        new_carry = jnp.concatenate([new_fast, new_slow], axis=-1)
-        return new_carry, new_carry

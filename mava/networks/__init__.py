@@ -18,10 +18,8 @@ from mava.networks.base import (
     FeedForwardQNet,
     FeedForwardValueNet,
     RecQNetwork,
-    GatedResidualActor,
     RecurrentActor,
     RecurrentValueNet,
     ScannedRNN,
-    mixture_logits,
 )
 from mava.networks.sable_network import SableNetwork
