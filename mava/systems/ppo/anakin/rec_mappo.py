@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import copy
+import dataclasses
+import importlib
 import time
 from typing import Any, Tuple
 
@@ -119,6 +121,21 @@ def _masked_normalise(x: chex.Array, w: Any = None) -> chex.Array:
     mean = jnp.sum(safe_x * w) / denom
     var = jnp.sum(w * jnp.square(safe_x - mean)) / denom
     return jnp.where(w > 0, (x - mean) / (jnp.sqrt(var) + 1e-8), 0.0)
+
+
+def _import_path(path: str) -> Any:
+    """Fork: resolve ``"module:name"`` (or ``"module.name"``) to the object.
+
+    The one spelling rule for every optional import path the fork honours
+    (``network.actor_class``, ``system.aux_loss_fn``). Absent keys never reach
+    it, so a run that sets neither never imports anything.
+    """
+    module, sep, attr = path.partition(":")
+    if not sep:
+        module, _, attr = path.rpartition(".")
+    if not module or not attr:
+        raise ValueError(f"{path!r} is not an import path: write 'package.module:name'")
+    return getattr(importlib.import_module(module), attr)
 
 
 def _find_sown(d: Any, key: str) -> Any:
@@ -350,9 +367,17 @@ def get_learner_fn(
                     # telemetry must not depend on a loss coefficient either.
                     _tcfg = config.network.get("target_gate", None)
                     tgate_on = _tcfg is not None and _tcfg.get("enabled", False)
+                    # Fork: extension hook. `system.aux_loss_fn` is an optional
+                    # import path to an auxiliary objective defined OUTSIDE this
+                    # package (a comparison method that trains a head on
+                    # something the policy loss does not supervise). It needs
+                    # the sown intermediates, so it joins the two conditions
+                    # that already ask for them.
+                    aux_loss_path = config.system.get("aux_loss_fn", None)
                     aux_pred = None
+                    sown = None
                     tgate = tgate_h0 = tgate_k = None
-                    if aux_coef or tgate_on:
+                    if aux_coef or tgate_on or aux_loss_path:
                         ((_, actor_policy), inters) = actor_apply_fn(
                             actor_params,
                             traj_batch.hstates.policy_hidden_state[0],
@@ -440,6 +465,21 @@ def get_learner_fn(
                         target_gate_mean = jnp.mean(tgate)
                         target_gate_h0 = jnp.reshape(tgate_h0, ())
                         target_gate_k = jnp.reshape(tgate_k, ())
+
+                    # Fork: extension hook (see `aux_loss_path` above).
+                    # `fn(sown, traj_batch, config) -> (loss, telemetry)`; the
+                    # loss enters `total_loss` scaled by `system.aux_loss_coef`
+                    # and the telemetry keys are merged into `loss_info` so the
+                    # objective a comparison method adds is visible per block.
+                    # An EMPTY dict without the key: no leaf, no op, and the
+                    # existing tuple is what the unpack below still sees.
+                    aux_extra: dict = {}
+                    if aux_loss_path:
+                        ext_loss, aux_extra = _import_path(str(aux_loss_path))(
+                            sown, traj_batch, config
+                        )
+                        aux_loss_coef = float(config.system.get("aux_loss_coef", 0.0))
+                        total_loss = total_loss + aux_loss_coef * ext_loss
                     return total_loss, (
                         actor_loss,
                         entropy,
@@ -447,6 +487,7 @@ def get_learner_fn(
                         target_gate_mean,
                         target_gate_h0,
                         target_gate_k,
+                        aux_extra,
                     )
 
                 def _critic_loss_fn(
@@ -562,6 +603,7 @@ def get_learner_fn(
                     target_gate_mean,
                     target_gate_h0,
                     target_gate_k,
+                    aux_extra,
                 ) = actor_loss_info
                 value_loss, (unscaled_value_loss, huber_frac, clip_frac) = (
                     value_loss_info
@@ -592,6 +634,10 @@ def get_learner_fn(
                     "target_gate_h0": target_gate_h0,
                     "target_gate_k": target_gate_k,
                 }
+                # Fork: extension hook — an out-of-package auxiliary
+                # objective's own telemetry. Empty (and so a no-op) unless
+                # `system.aux_loss_fn` is set.
+                loss_info.update(aux_extra)
 
                 return (new_params, new_opt_state, entropy_key), loss_info
 
@@ -768,7 +814,7 @@ def learner_setup(
         config.system.target_slices = [list(p) for p in tgate_targets]
         config.system.conf_slices = [list(p) for p in tgate_conf]
 
-    actor_network = Actor(
+    actor_kwargs = dict(
         pre_torso=actor_pre_torso,
         post_torso=actor_post_torso,
         action_head=actor_action_head,
@@ -786,6 +832,20 @@ def learner_setup(
         ),
         gate_init_slope=float(tgate_cfg.get("init_slope", 200.0) if tgate_on else 200.0),
     )
+    # Fork: extension hook. `network.actor_class` is an optional import path to
+    # an actor built OUTSIDE this package — a comparison method whose defence
+    # lives in the policy architecture rather than in the environment. It is
+    # constructed with exactly the kwargs above, plus `layout=` (the env's own
+    # `actor_layout` table) when its dataclass declares that field, so such an
+    # actor never transcribes observation offsets. Absent — every run to date —
+    # this is the stock `RecurrentActor` call, unchanged.
+    actor_cls = Actor
+    actor_class_path = config.network.get("actor_class", None)
+    if actor_class_path:
+        actor_cls = _import_path(str(actor_class_path))
+        if "layout" in {f.name for f in dataclasses.fields(actor_cls)}:
+            actor_kwargs["layout"] = env.unwrapped.actor_layout
+    actor_network = actor_cls(**actor_kwargs)
     critic_network = Critic(
         pre_torso=critic_pre_torso,
         post_torso=critic_post_torso,
