@@ -108,3 +108,10 @@ class RNNPPOTransition(NamedTuple):
     # means "train on everything" and is an exact no-op — None is an empty
     # pytree node, so the trajectory structure is unchanged.
     learn_mask: Optional[chex.Array] = None
+    # Fork: per-agent TYPE label — "this agent lies this episode" — emitted
+    # beside ``learn_mask`` as ``extras["liar_mask"]``. NOT ``~learn_mask``:
+    # ``learn_mask`` drops the drawn adversary SLOT whatever its mode, and a
+    # decomposition-control slot reports the truth. Consumed only by an
+    # ``aux_loss_fn`` that wants the type (a supervised type-belief head);
+    # ``None`` when the env does not emit it, an exact no-op like the above.
+    liar_mask: Optional[chex.Array] = None

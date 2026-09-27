@@ -305,6 +305,9 @@ def get_learner_fn(
                 # Fork: absent unless the env opts in, in which case the
                 # field stays None and everything below is an exact no-op.
                 last_timestep.extras.get("learn_mask"),
+                # Fork: the per-episode type, for an aux loss that supervises
+                # on it; absent (None) unless the env emits it.
+                last_timestep.extras.get("liar_mask"),
             )
             learner_state = RNNLearnerState(
                 params, opt_states, key, env_state, timestep, done, hstates
