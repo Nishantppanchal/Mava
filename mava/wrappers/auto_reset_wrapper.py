@@ -15,7 +15,7 @@
 # Note this is only here until this is merged into jumanji
 # PR: https://github.com/instadeepai/jumanji/pull/223
 
-from typing import Tuple
+from typing import Callable, Tuple
 
 import chex
 import jax
@@ -33,12 +33,32 @@ class AutoResetWrapper(Wrapper):
     terminal TimeStep is reset to the reset observation and StepType.LAST, respectively.
     The reward, discount, and extras retrieved from the transition to the terminal state.
     NOTE: The observation from the terminal TimeStep is stored in timestep.extras["real_next_obs"].
+
+    Fork (pursuit) — THE EXTRAS RULE AT A RESET. The returned timestep is two
+    things at once: the END of the old episode (reward, discount, step_type,
+    ``real_next_obs``, and every extra that reports on the transition just
+    taken or the episode just finished — ``env_metrics``, ``episode_metrics``,
+    ``attacker_kind``) and the START of the new one (``observation``, and the
+    learner reads it as ``last_timestep`` on the NEXT step, pairing its
+    observation with its extras). Extras that describe the STATE the
+    observation belongs to must therefore come from the reset timestep, or the
+    first transition of every episode carries the previous episode's labels.
+    Those keys are listed in :attr:`RESET_EXTRAS_KEYS` — ``learn_mask`` (which
+    agents the learner trains on) and ``liar_mask`` (who lies this episode):
+    per-episode properties of the state, read by ``rec_mappo`` off
+    ``last_timestep`` together with ``last_timestep.observation``. Every other
+    extra keeps the terminal step's value. A key is swapped only when both
+    timesteps carry it, so an env that emits neither is untouched.
     WARNING: do not `jax.vmap` the wrapped environment (e.g. do not use with the `VmapWrapper`),
     which would lead to inefficient computation due to both the `step` and `reset` functions
     being processed each time `step` is called. Please use the `VmapAutoResetWrapper` instead.
     """
 
     OBS_IN_EXTRAS_KEY = "real_next_obs"
+
+    #: Fork (pursuit): extras that describe the state the observation belongs
+    #: to, taken from the RESET timestep at an automatic reset (class docstring).
+    RESET_EXTRAS_KEYS = ("learn_mask", "liar_mask")
 
     # This init isn't really needed as jumanji.Wrapper will forward the attributes,
     # but mypy doesn't realize this.
@@ -54,11 +74,12 @@ class AutoResetWrapper(Wrapper):
         tail is exposed as :meth:`finish_auto_reset`, so that
         :class:`BatchAutoResetWrapper` can run it OUTSIDE the per-env ``vmap``
         under a ``lax.cond`` on ``jnp.any(done)``. Deferring is exact rather
-        than approximate: the tail reads only ``state.key`` and
-        ``timestep.observation``, while the wrapper it is deferred past
-        (``RecordEpisodeMetrics``) reads only ``timestep.reward`` and
-        ``timestep.step_type`` and threads the env state through untouched — so
-        the two orderings commute bit for bit.
+        than approximate: the tail reads only ``state.key``,
+        ``timestep.observation`` and the :attr:`RESET_EXTRAS_KEYS` extras,
+        while the wrapper it is deferred past (``RecordEpisodeMetrics``) reads
+        only ``timestep.reward`` and ``timestep.step_type``, writes only
+        ``extras["episode_metrics"]`` (not a reset key) and threads the env
+        state through untouched — so the two orderings commute bit for bit.
         """
         super().__init__(env)
         self._env: MarlEnv
@@ -96,10 +117,31 @@ class AutoResetWrapper(Wrapper):
         # Place original observation in extras.
         state, timestep = self._obs_in_extras(state, timestep)
 
-        # Replace observation with reset observation.
-        timestep = timestep.replace(observation=reset_timestep.observation)  # type: ignore
+        # Replace observation with reset observation, and the state-describing
+        # extras with the reset timestep's (class docstring).
+        extras = self._reset_extras(timestep.extras, reset_timestep.extras, lambda r, s: r)
+        timestep = timestep.replace(  # type: ignore
+            observation=reset_timestep.observation, extras=extras
+        )
 
         return state, timestep
+
+    @classmethod
+    def _reset_extras(
+        cls,
+        extras: dict,
+        reset_extras: dict,
+        select: Callable[[chex.Array, chex.Array], chex.Array],
+    ) -> dict:
+        """``extras`` with each :attr:`RESET_EXTRAS_KEYS` entry present in both
+        dicts replaced by ``select(reset, terminal)`` leaf-wise; every other key
+        (the terminal step's report on the transition / the ended episode) as
+        is. A new dict: the caller's is not mutated."""
+        out = dict(extras)
+        for k in cls.RESET_EXTRAS_KEYS:
+            if k in out and k in reset_extras:
+                out[k] = jax.tree_util.tree_map(select, reset_extras[k], out[k])
+        return out
 
     def reset(self, key: chex.PRNGKey) -> Tuple[State, TimeStep[Observation]]:
         return self._obs_in_extras(*super().reset(key))
@@ -138,6 +180,12 @@ class AutoResetWrapper(Wrapper):
         Unconditional reset (same key discipline as the old ``_auto_reset``),
         then select per leaf. Under ``vmap`` ``done`` is a scalar per
         environment, so the where broadcasts over every leaf shape.
+
+        The observation and the :attr:`RESET_EXTRAS_KEYS` extras are selected
+        from the reset timestep; everything else in ``extras`` stays the
+        terminal step's (class docstring). Both the per-env path and the
+        batch path (``BatchAutoResetWrapper``) run this one method, so they
+        change together.
         """
         key, _ = jax.random.split(state.key)  # type: ignore
         reset_state, reset_timestep = self._env.reset(key)
@@ -151,7 +199,8 @@ class AutoResetWrapper(Wrapper):
         timestep = timestep.replace(  # type: ignore
             observation=jax.tree_util.tree_map(
                 select, reset_timestep.observation, timestep.observation
-            )
+            ),
+            extras=self._reset_extras(timestep.extras, reset_timestep.extras, select),
         )
 
         return state, timestep

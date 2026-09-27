@@ -121,7 +121,9 @@ class RecordEpisodeMetrics(Wrapper):
         Fork (pursuit). ``BatchAutoResetWrapper`` runs the
         inner ``AutoResetWrapper``'s reset tail once per BATCH, after this
         wrapper has already stepped. That reordering is exact: the tail touches
-        only ``state.env_state`` and ``timestep.observation``, while ``step``
+        only ``state.env_state``, ``timestep.observation`` and the
+        ``AutoResetWrapper.RESET_EXTRAS_KEYS`` extras (never
+        ``episode_metrics``, which keeps reporting the ENDED episode), while ``step``
         above reads only ``timestep.reward`` and ``timestep.step_type`` and
         passes ``env_state`` through opaquely — so the episode counters are the
         same either way, and this wrapper's own leaves (``key`` and the
