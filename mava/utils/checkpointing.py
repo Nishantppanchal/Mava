@@ -43,6 +43,7 @@ class Checkpointer:
         save_interval_steps: int = 1,
         max_to_keep: Optional[int] = 1,
         keep_period: Optional[int] = None,
+        keep_best: bool = True,
     ):
         """Initialise the checkpointer tool
 
@@ -63,6 +64,14 @@ class Checkpointer:
             keep_period (Optional[int], optional):
                 If set, will not delete any checkpoint where
                 checkpoint_step % keep_period == 0. Defaults to None.
+            keep_best (bool, optional):
+                Which ``max_to_keep`` checkpoints survive. True (the default, and
+                the only behaviour before this argument existed) ranks them by the
+                ``episode_return`` passed to ``save`` and keeps the highest, so
+                ``latest_step()`` is the latest of the best few -- not necessarily
+                the last step trained. False retains by RECENCY (no ``best_fn``):
+                the final checkpoint of a run is always kept and ``latest_step()``
+                is the final step. ``episode_return`` is recorded either way.
 
         """
         # When we load an existing checkpoint, the sharding info is read from the checkpoint file,
@@ -78,10 +87,13 @@ class Checkpointer:
             checkpoint_uid if checkpoint_uid else datetime.now().strftime("%Y%m%d%H%M%S")
         )
 
+        # Retention rule: by training-eval return (``keep_best``) or by recency.
+        best: Dict[str, Any] = (
+            {"best_fn": lambda x: x["episode_return"], "best_mode": "max"} if keep_best else {}
+        )
         options = orbax.checkpoint.CheckpointManagerOptions(
             create=True,
-            best_fn=lambda x: x["episode_return"],
-            best_mode="max",
+            **best,
             save_interval_steps=save_interval_steps,
             max_to_keep=max_to_keep,
             keep_period=keep_period,
