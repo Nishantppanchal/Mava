@@ -71,7 +71,16 @@ class Checkpointer:
                 ``latest_step()`` is the latest of the best few -- not necessarily
                 the last step trained. False retains by RECENCY (no ``best_fn``):
                 the final checkpoint of a run is always kept and ``latest_step()``
-                is the final step. ``episode_return`` is recorded either way.
+                is the final step. Under False the return is NOT recorded with the
+                checkpoint: orbax writes a step's ``metrics`` item only when a
+                ``best_fn`` is set, so ``episode_return`` is dropped at ``save``
+                and only the logger's output carries it.
+
+                Either way a run directory is not a place to continue a run: the
+                trainer counts its step from 0 in every process, and orbax's
+                ``should_save`` refuses every step at or below ``latest_step()``,
+                so a second run into the same ``checkpoint_uid`` saves nothing
+                until its count passes the first run's last step.
 
         """
         # When we load an existing checkpoint, the sharding info is read from the checkpoint file,
